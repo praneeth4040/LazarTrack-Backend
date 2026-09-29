@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: lazartrack-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: EASYOCR_URL
+        value: ""   # Not needed — local EasyOCR is used
+    autoDeploy: true
