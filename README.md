@@ -11,6 +11,7 @@ license: mit
 short_description: Free Fire match scoreboard OCR extraction API
 ---
 
+
 # 🎯 LazarTrack – Match Stats Extractor
 
 FastAPI + Gradio backend for the **LazarTrack** Free Fire match tracking app.
