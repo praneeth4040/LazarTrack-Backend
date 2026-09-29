@@ -147,4 +147,4 @@ app = gr.mount_gradio_app(fastapi_app, demo, path="/")
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 7860))
     log.info("Starting LazarTrack server on port %d | Device: %s", port, DEVICE)
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
