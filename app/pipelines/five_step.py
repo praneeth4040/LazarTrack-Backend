@@ -205,15 +205,34 @@ def run_five_step_pipeline(
     # ------------------------------------------------------------
     # Extract map from match info (lightweight EasyOCR)
     # ------------------------------------------------------------
-    map_name = "Unknown"
-    map_ocr_texts: List[str] = []
+    from difflib import SequenceMatcher
     try:
         map_ocr_texts = easy_reader.readtext(match_info, detail=0)
         joined = " ".join(map_ocr_texts)
-        for name in _KNOWN_MAPS:
-            if re.search(re.escape(name), joined, re.IGNORECASE):
-                map_name = name
+
+        best_score = 0.0
+        best_map = "Unknown"
+
+        for word in joined.split():
+            clean_word = re.sub(r'[^a-zA-Z]', '', word)
+            if not clean_word:
+                continue
+            for name in _KNOWN_MAPS:
+                # Direct match check first
+                if clean_word.lower() == name.lower():
+                    best_score = 1.0
+                    best_map = name
+                    break
+                # Fuzzy similarity score check
+                ratio = SequenceMatcher(None, clean_word.lower(), name.lower()).ratio()
+                if ratio >= 0.80 and ratio > best_score:
+                    best_score = ratio
+                    best_map = name
+
+            if best_score == 1.0:
                 break
+
+        map_name = best_map
     except Exception as e:
         log.warning("Map detection OCR failed: %s", e)
 
