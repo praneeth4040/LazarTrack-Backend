@@ -14,22 +14,18 @@ from app.ocr.smart_table_detector import (
     slice_player_table_columns,
 )
 from app.ocr.local_easyocr import get_easyocr_reader
-from app.ocr.paddle_ocr import run_paddle_ocr
 
 IMG_DIR = os.path.join(os.path.dirname(__file__), "img")
 OUTPUT_BASE_DIR = os.path.join(IMG_DIR, "output")
 
 
-def parse_player_cell_ocr(paddle_items: list, easy_items: list, col_key: str):
+def parse_player_cell_ocr(easy_items: list, col_key: str):
     """
-    Parses OCR results for a specific cell, picking the best text from PaddleOCR or EasyOCR.
+    Parses OCR results for a specific cell using EasyOCR text output.
     """
-    p_texts = [item["text"].strip() for item in paddle_items if item.get("text")]
     e_texts = [item["text"].strip() for item in easy_items if item.get("text")]
+    return e_texts[0] if e_texts else "0"
 
-    # Prefer PaddleOCR as primary
-    primary_text = p_texts[0] if p_texts else (e_texts[0] if e_texts else "0")
-    return primary_text
 
 
 def process_image_pipeline(image_path: str, output_dir: str, easy_reader) -> dict:
@@ -124,16 +120,7 @@ def process_image_pipeline(image_path: str, output_dir: str, easy_reader) -> dic
     }
 
     # 5a: Match Info OCR
-    match_info_paddle = run_paddle_ocr(match_info)
-    ann_match_info = match_info.copy()
-    for item in match_info_paddle:
-        pts = np.array(item["bbox"], dtype=np.int32)
-        cv2.polylines(ann_match_info, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
-        cv2.putText(ann_match_info, item["text"], (int(pts[0][0]), int(pts[0][1])), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-    step5_ann_info_path = os.path.join(output_dir, "step5_annotated_match_info.png")
-    cv2.imwrite(step5_ann_info_path, ann_match_info)
-    ocr_results["match_info"] = match_info_paddle
+    ocr_results["match_info"] = []
 
     # 5b: Dynamic Player Slot Detection & Super-Scaled Cell Cropping
     player_cells_y = [
