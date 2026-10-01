@@ -4,6 +4,63 @@ from io import BytesIO
 from PIL import Image, UnidentifiedImageError
 from fastapi import HTTPException
 
+
+def get_interpolation_methods() -> dict:
+    """Returns available OpenCV interpolation algorithms."""
+    return {
+        "lanczos": cv2.INTER_LANCZOS4,
+        "cubic": cv2.INTER_CUBIC,
+        "linear": cv2.INTER_LINEAR,
+        "nearest": cv2.INTER_NEAREST,
+        "area": cv2.INTER_AREA,
+    }
+
+
+def generate_preprocessing_variants(cell_crop: np.ndarray) -> dict:
+    """
+    Generates 5 distinct preprocessing variants for an image crop:
+      1. raw: original BGR crop
+      2. grayscale: converted to 3-channel grayscale
+      3. contrast: CLAHE contrast enhancement
+      4. sharpened: 2D kernel edge sharpening
+      5. thresholded: Adaptive Gaussian binarization
+      6. denoised: Fast NlMeans / Bilateral denoised
+    """
+    variants = {}
+    if cell_crop is None or cell_crop.size == 0:
+        return variants
+
+    # 1. Raw
+    variants["raw"] = cell_crop.copy()
+
+    # 2. Grayscale (3-channel)
+    gray = cv2.cvtColor(cell_crop, cv2.COLOR_BGR2GRAY)
+    variants["grayscale"] = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    # 3. Contrast Enhanced (CLAHE)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe_gray = clahe.apply(gray)
+    variants["contrast"] = cv2.cvtColor(clahe_gray, cv2.COLOR_GRAY2BGR)
+
+    # 4. Sharpened
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    sharpened_bgr = cv2.filter2D(cell_crop, -1, kernel)
+    variants["sharpened"] = sharpened_bgr
+
+    # 5. Thresholded (Adaptive Gaussian)
+    bilateral = cv2.bilateralFilter(gray, 7, 50, 50)
+    adaptive_thresh = cv2.adaptiveThreshold(
+        bilateral, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    variants["thresholded"] = cv2.cvtColor(adaptive_thresh, cv2.COLOR_GRAY2BGR)
+
+    # 6. Denoised
+    denoised_gray = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
+    variants["denoised"] = cv2.cvtColor(denoised_gray, cv2.COLOR_GRAY2BGR)
+
+    return variants
+
+
 def binarize_image(img_bgr: np.ndarray) -> np.ndarray:
     """
     Enhanced Adaptive Binarization:
@@ -58,3 +115,4 @@ def preprocess_image(raw_bytes: bytes, target_width: int = 1920) -> bytes:
 
     _, buf = cv2.imencode(".jpg", sharpened, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
     return buf.tobytes()
+

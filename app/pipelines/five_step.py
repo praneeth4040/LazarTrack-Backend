@@ -341,20 +341,40 @@ def run_five_step_pipeline(
                 "final": full_ign,
             }
 
-        # --- K/D/A ---
-        scaled_kda = cv2.resize(
-            kda_crop,
-            (kda_crop.shape[1] * 6, kda_crop.shape[0] * 6),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-        e_kda = easy_reader.readtext(scaled_kda, allowlist="0123456789/", detail=0)
-        raw_kda = e_kda[0] if e_kda else ""
+        # --- K/D/A Ensemble OCR ---
+        from app.ocr.preprocessor import generate_preprocessing_variants, get_interpolation_methods
+        kda_variants = generate_preprocessing_variants(kda_crop)
+        interpolations = get_interpolation_methods()
+
+        kda_candidates = []
+        # Try primary contrast/sharpened variants with Lanczos & Cubic interpolation at 4x-5x scale
+        for var_name in ["contrast", "sharpened", "thresholded", "raw"]:
+            img_var = kda_variants.get(var_name, kda_crop)
+            for scale_factor in [4, 5]:
+                for interp_name in ["lanczos", "cubic"]:
+                    interp_flag = interpolations[interp_name]
+                    scaled_kda = cv2.resize(
+                        img_var,
+                        (img_var.shape[1] * scale_factor, img_var.shape[0] * scale_factor),
+                        interpolation=interp_flag,
+                    )
+                    e_res = easy_reader.readtext(scaled_kda, allowlist="0123456789/", detail=0)
+                    if e_res:
+                        kda_candidates.append(e_res[0])
+
+        raw_kda = kda_candidates[0] if kda_candidates else ""
+        # Find candidate with 2 slashes or matching 3 numbers
+        for cand in kda_candidates:
+            if cand.count('/') == 2 or len(re.sub(r'[^0-9]', '', cand)) == 3:
+                raw_kda = cand
+                break
+
         kills, _death, assists = _parse_kda_smart(raw_kda)
         if debug:
             p_debug["cells"]["col1_kda"] = {
                 "raw_crop": _encode_png(kda_crop),
-                "scaled_6x": _encode_png(scaled_kda),
-                "ocr_raw": e_kda,
+                "scaled_sample": _encode_png(cv2.resize(kda_crop, (kda_crop.shape[1] * 4, kda_crop.shape[0] * 4))),
+                "candidates": kda_candidates,
                 "parsed_kda": [kills, _death, assists],
             }
 
