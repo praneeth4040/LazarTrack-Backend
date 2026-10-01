@@ -6,6 +6,7 @@ log = logging.getLogger("app.api.v1.visualize")
 router = APIRouter(tags=["Visual UI"])
 
 _DEBUG_POST_URL = "/api/v1/pipeline/match_stats/debug"
+_COMPARE_POST_URL = "/api/v1/pipeline/match_stats/compare"
 
 
 _HTML_RAW = r"""
@@ -461,7 +462,7 @@ function renderCell(title, cell) {
 </html>
 """
 
-_HTML = _HTML_RAW.replace("__DEBUG_POST_URL__", repr(_DEBUG_POST_URL))
+_HTML = _HTML_RAW.replace("__DEBUG_POST_URL__", repr(_DEBUG_POST_URL)).replace("__COMPARE_POST_URL__", repr(_COMPARE_POST_URL))
 
 
 @router.get("/visualize", response_class=HTMLResponse, include_in_schema=False)

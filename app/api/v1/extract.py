@@ -128,3 +128,42 @@ async def pipeline_match_stats_debug(
         },
         "steps": steps,
     }
+
+
+@router.post("/match_stats/compare")
+async def pipeline_match_stats_compare(
+    file: UploadFile = File(..., description="Free Fire match scoreboard screenshot"),
+):
+    """
+    Comparison endpoint: Runs extraction twice (1. Deployed HF EasyOCR, 2. Local EasyOCR)
+    and returns side-by-side results and detailed debug steps for visual comparison.
+    """
+    from app.ocr.local_easyocr import get_easyocr_reader, get_raw_local_easyocr_reader
+    raw = await _validate_and_read(file)
+
+    log.info("[pipeline/match_stats/compare] Running comparison for '%s'...", file.filename or "screenshot.jpg")
+
+    # 1. Deployed HF EasyOCR (with local fallback wrapper)
+    deployed_reader = get_easyocr_reader()
+    deployed_data = run_five_step_pipeline(raw, easy_reader=deployed_reader, debug=True)
+    deployed_steps = deployed_data.pop("steps", [])
+
+    # 2. Pure Local EasyOCR
+    local_reader = get_raw_local_easyocr_reader()
+    local_data = run_five_step_pipeline(raw, easy_reader=local_reader, debug=True)
+    local_steps = local_data.pop("steps", [])
+
+    return {
+        "pipeline_id": PIPELINE_ID,
+        "pipeline_name": PIPELINE_NAME,
+        "deployed": {
+            "name": "Deployed EasyOCR (HF Space)",
+            "result": deployed_data,
+            "steps": deployed_steps,
+        },
+        "local": {
+            "name": "Local EasyOCR",
+            "result": local_data,
+            "steps": local_steps,
+        },
+    }

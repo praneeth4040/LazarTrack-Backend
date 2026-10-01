@@ -12,18 +12,23 @@ log = logging.getLogger("app.ocr.remote")
 # Singleton reader instance for local fallback
 _reader = None
 
-def get_easyocr_reader():
-    """Returns local EasyOCR reader instance (used as fallback or wrapper)."""
+def get_raw_local_easyocr_reader():
+    """Returns pure local EasyOCR reader instance without remote wrapper."""
     global _reader
     if _reader is None:
-        log.info("Initializing local EasyOCR reader instance (fallback)...")
+        log.info("Initializing local EasyOCR reader instance...")
         use_gpu = False
         try:
             use_gpu = torch.cuda.is_available()
         except Exception as e:
             log.warning("Could not check CUDA GPU availability (%s), defaulting to CPU", e)
         _reader = easyocr.Reader(['en'], gpu=use_gpu)
-    return RemoteEasyOCRWrapper(_reader)
+    return _reader
+
+def get_easyocr_reader():
+    """Returns RemoteEasyOCRWrapper with local fallback."""
+    local_instance = get_raw_local_easyocr_reader()
+    return RemoteEasyOCRWrapper(local_instance)
 
 
 class RemoteEasyOCRWrapper:
