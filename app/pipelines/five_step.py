@@ -317,12 +317,8 @@ def run_five_step_pipeline(
             std_val = float(np.std(gray_c1))
         except Exception:
             continue
-        scaled_c1 = cv2.resize(
-            c1_crop_raw,
-            (c1_crop_raw.shape[1] * 4, c1_crop_raw.shape[0] * 4),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-        c1_ocr_res = easy_reader.readtext(scaled_c1, detail=1)
+        # Preflight: send raw crop to /ocr/detail — server upscales at 4x contrast
+        c1_ocr_res = easy_reader.readtext(c1_crop_raw, detail=1, preprocess="contrast", scale=4)
 
         p_debug["preflight_std"] = std_val
         p_debug["preflight_ocr_items"] = len(c1_ocr_res)
@@ -342,65 +338,49 @@ def run_five_step_pipeline(
         name_crop = c1_crop_raw[0 : int(h_c1 * 0.55), :]
         kda_crop = c1_crop_raw[int(h_c1 * 0.48) :, :]
 
-        # --- Name ---
-        scaled_name = cv2.resize(
-            name_crop,
-            (name_crop.shape[1] * 4, name_crop.shape[0] * 4),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-        e_names = easy_reader.readtext(scaled_name, detail=0)
+        # --- Name: send raw crop, server applies contrast+4x ---
+        e_name_results = easy_reader.readtext(name_crop, detail=1, preprocess="contrast", scale=4)
+        e_names = [text for (_, text, _) in e_name_results]
         full_ign = " ".join(e_names).strip() if e_names else "Unknown"
         if not full_ign:
             full_ign = "Unknown"
         if debug:
             p_debug["cells"]["col1_name"] = {
                 "raw_crop": _encode_png(name_crop),
-                "scaled_4x": _encode_png(scaled_name),
-                "ocr_raw": e_names,
+                "ocr_regions": [(text, round(conf, 3)) for (_, text, conf) in e_name_results],
                 "final": full_ign,
             }
 
-        # --- K/D/A Ensemble OCR ---
-        from app.ocr.preprocessor import generate_preprocessing_variants, get_interpolation_methods
-        kda_variants = generate_preprocessing_variants(kda_crop)
-        interpolations = get_interpolation_methods()
+        # --- K/D/A: single call to /ocr/detail, regex search for nn/nn/nn ---
+        # No client-side preprocessing — server applies contrast+4x
+        kda_ocr_results = easy_reader.readtext(
+            kda_crop, allowlist="0123456789/", detail=1, preprocess="contrast", scale=4
+        )
 
-        kda_candidates = []
-        variant_crops_encoded = {}
-        for vname, vimg in kda_variants.items():
-            if debug:
-                variant_crops_encoded[vname] = _encode_png(vimg)
+        # Join all detected text regions and search for exact K/D/A pattern
+        joined_kda = " ".join(
+            text for (_, text, _) in kda_ocr_results
+            if isinstance(text, str)
+        )
+        kda_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{1,2})', joined_kda)
 
-        # Try primary contrast/sharpened variants with Lanczos & Cubic interpolation at 4x-5x scale
-        for var_name in ["contrast", "sharpened", "thresholded", "raw"]:
-            img_var = kda_variants.get(var_name, kda_crop)
-            for scale_factor in [4, 5]:
-                for interp_name in ["lanczos", "cubic"]:
-                    interp_flag = interpolations[interp_name]
-                    scaled_kda = cv2.resize(
-                        img_var,
-                        (img_var.shape[1] * scale_factor, img_var.shape[0] * scale_factor),
-                        interpolation=interp_flag,
-                    )
-                    e_res = easy_reader.readtext(scaled_kda, allowlist="0123456789/", detail=0)
-                    if e_res:
-                        kda_candidates.append(f"[{var_name}|{interp_name}|{scale_factor}x]: {e_res[0]}")
+        if kda_match:
+            kills, _death, assists = int(kda_match.group(1)), int(kda_match.group(2)), int(kda_match.group(3))
+            kda_conf = 1.0
+            raw_kda = kda_match.group(0)
+        else:
+            raw_kda = joined_kda.strip()
+            kills, _death, assists = _parse_kda_smart(raw_kda)
+            kda_conf = 0.5 if raw_kda else 0.0
 
-        raw_kda = ""
-        for cand_str in kda_candidates:
-            cand = cand_str.split("]: ", 1)[-1]
-            if cand.count('/') == 2 or len(re.sub(r'[^0-9]', '', cand)) == 3:
-                raw_kda = cand
-                break
-        if not raw_kda and kda_candidates:
-            raw_kda = kda_candidates[0].split("]: ", 1)[-1]
-
-        kills, _death, assists = _parse_kda_smart(raw_kda)
         if debug:
             p_debug["cells"]["col1_kda"] = {
                 "raw_crop": _encode_png(kda_crop),
-                "variant_crops": variant_crops_encoded,
-                "candidates": kda_candidates,
+                "ocr_regions": [(text, round(conf, 3)) for (_, text, conf) in kda_ocr_results],
+                "joined": joined_kda,
+                "pattern_matched": kda_match is not None,
+                "raw_kda": raw_kda,
+                "kda_conf": kda_conf,
                 "parsed_kda": [kills, _death, assists],
                 "final": f"K={kills} D={_death} A={assists}",
             }
@@ -425,19 +405,14 @@ def run_five_step_pipeline(
                 cell_crop = player_table[y1 + 5 : y2 + 25, xs:xe]
                 cell_debug: Dict[str, Any] = {"raw_crop": _encode_png(cell_crop) if debug else ""}
                 try:
-                    scaled = cv2.resize(
-                        cell_crop,
-                        (cell_crop.shape[1] * 5, cell_crop.shape[0] * 5),
-                        interpolation=cv2.INTER_LANCZOS4,
-                    )
-                    if debug:
-                        cell_debug["scaled_5x"] = _encode_png(scaled)
+                    # Server applies contrast+5x upscale
                     e_res = easy_reader.readtext(
-                        scaled, allowlist="0123456789.%", detail=0
+                        cell_crop, allowlist="0123456789.%", detail=1,
+                        preprocess="contrast", scale=5
                     )
-                    cell_debug["ocr_raw"] = e_res
                     if e_res:
-                        col8_hsr = _force_headshot_rate(e_res[0])
+                        col8_hsr = _force_headshot_rate(e_res[0][1])
+                    cell_debug["ocr_regions"] = [(text, round(conf, 3)) for (_, text, conf) in e_res]
                     cell_debug["final"] = col8_hsr
                 except Exception as ex:
                     cell_debug["error"] = str(ex)
@@ -449,19 +424,14 @@ def run_five_step_pipeline(
                 cell_crop = player_table[y1 : y2 - 10, xs : xs + crop_w]
                 cell_debug = {"raw_crop": _encode_png(cell_crop) if debug else "", "left_48_only": True}
                 try:
-                    scaled_6x = cv2.resize(
-                        cell_crop,
-                        (cell_crop.shape[1] * 6, cell_crop.shape[0] * 6),
-                        interpolation=cv2.INTER_LANCZOS4,
-                    )
-                    if debug:
-                        cell_debug["scaled_6x"] = _encode_png(scaled_6x)
+                    # Server applies contrast+6x upscale
                     e_res = easy_reader.readtext(
-                        scaled_6x, allowlist="0123456789", detail=0
+                        cell_crop, allowlist="0123456789", detail=1,
+                        preprocess="contrast", scale=6
                     )
-                    cell_debug["ocr_raw"] = e_res
-                    val_str = e_res[0].strip() if (e_res and e_res[0].strip()) else "0"
+                    val_str = e_res[0][1].strip() if (e_res and e_res[0][1].strip()) else "0"
                     val = _force_digits(val_str)
+                    cell_debug["ocr_regions"] = [(text, round(conf, 3)) for (_, text, conf) in e_res]
                     cell_debug["final"] = val
                     if key == "col2_dmg":
                         col2_damage = val

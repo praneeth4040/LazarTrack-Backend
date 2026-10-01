@@ -190,6 +190,9 @@ def split_match_info_and_player_table(table_crop: np.ndarray, reader=None) -> Tu
 
         tagline_bottom_y = 0
         for bbox, text, conf in results:
+            # Guard: skip results with no usable bbox coordinates (e.g. from plain-string remote responses)
+            if not bbox or len(bbox) < 3:
+                continue
             abs_y1 = 40 + int(bbox[0][1])
             abs_y2 = 40 + int(bbox[2][1])
             txt_upper = text.strip().upper()

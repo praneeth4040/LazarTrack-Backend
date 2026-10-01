@@ -213,7 +213,7 @@ _HTML_RAW = r"""
     </div>
 
     <div class="card">
-      <h2 class="section">Per-Player Debug (Cells, Scaled Crops, Raw OCR)</h2>
+      <h2 class="section">Per-Player Debug (Cells, Raw Crops, OCR Regions &amp; Confidence)</h2>
       <div id="playerDebugContainer"></div>
     </div>
 
@@ -420,23 +420,68 @@ function renderPlayerDebug(steps) {
   }).join('');
 }
 
+function confPill(conf) {
+  if (conf == null) return '';
+  const pct = (conf * 100).toFixed(0);
+  const cls = conf >= 0.85 ? 'good' : conf >= 0.65 ? 'warn' : 'bad';
+  return `<span class="pill ${cls}">${pct}%</span>`;
+}
+
 function renderCell(title, cell) {
   if (!cell) return '';
   const imgs = [];
   if (cell.raw_crop) imgs.push({label:'raw crop', src:cell.raw_crop});
-  if (cell.variant_crops) {
-    Object.entries(cell.variant_crops).forEach(([vname, vsrc]) => {
-      imgs.push({label: `variant: ${vname}`, src: vsrc});
-    });
+
+  // OCR regions table with per-region confidence
+  let ocrRegionsHtml = '';
+  if (cell.ocr_regions && cell.ocr_regions.length) {
+    ocrRegionsHtml = `
+      <div class="meta" style="margin-top:8px">OCR Regions (text · confidence):</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+        ${cell.ocr_regions.map(([text, conf]) =>
+          `<span style="display:inline-flex;align-items:center;gap:4px;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:3px 8px;font-family:var(--mono);font-size:12px">
+            ${escapeHtml(text)} ${confPill(conf)}
+          </span>`
+        ).join('')}
+      </div>`;
+  } else if (cell.ocr_raw != null) {
+    // Legacy fallback
+    ocrRegionsHtml = `<div class="meta" style="margin-top:8px">Raw OCR:</div>
+      <div class="ocr-texts">${escapeHtml(JSON.stringify(cell.ocr_raw, null, 2))}</div>`;
   }
-  if (cell.scaled_4x) imgs.push({label:'scaled 4x (name)', src:cell.scaled_4x});
-  if (cell.scaled_5x) imgs.push({label:'scaled 5x (HSR)', src:cell.scaled_5x});
-  if (cell.scaled_6x) imgs.push({label:'scaled 6x (numeric)', src:cell.scaled_6x});
+
+  // KDA-specific fields
+  let kdaHtml = '';
+  if (cell.joined != null) {
+    kdaHtml += `<div class="meta" style="margin-top:8px">Joined regions:</div>
+      <div class="ocr-texts">${escapeHtml(cell.joined || '(empty)')}</div>`;
+  }
+  if (cell.raw_kda != null) {
+    kdaHtml += `<div class="meta" style="margin-top:8px">Raw KDA string → Parsed:</div>
+      <div class="ocr-texts">${escapeHtml(cell.raw_kda)} → ${escapeHtml(JSON.stringify(cell.parsed_kda))}</div>`;
+  }
+  if (cell.pattern_matched != null) {
+    const pm = cell.pattern_matched;
+    kdaHtml += `<div style="margin-top:8px;display:flex;align-items:center;gap:8px">
+      <span class="meta">Pattern match (\\d+/\\d+/\\d+):</span>
+      <span class="pill ${pm?'good':'bad'}">${pm?'✓ matched':'✗ fallback heuristic'}</span>
+      ${cell.kda_conf != null ? confPill(cell.kda_conf) : ''}
+    </div>`;
+  }
+
+  // Parsed K/D/A
+  let parsedHtml = '';
+  if (cell.parsed_kda && !cell.raw_kda) {
+    parsedHtml = `<div class="meta" style="margin-top:8px">Parsed K/D/A:</div>
+      <div class="ocr-texts">${escapeHtml(JSON.stringify(cell.parsed_kda))}</div>`;
+  }
+
   return `
     <details class="cell" open>
       <summary>
         <span class="cell-key">${escapeHtml(title)}</span>
         ${cell.left_48_only?'<span class="pill info" style="margin-left:4px">left 48% only</span>':''}
+        ${cell.pattern_matched != null ? `<span class="pill ${cell.pattern_matched?'good':'warn'}" style="margin-left:4px">${cell.pattern_matched?'regex ✓':'heuristic'}</span>` : ''}
         <span class="cell-final">→ ${escapeHtml(cell.final == null ? '' : String(cell.final))}</span>
       </summary>
       <div class="cell-body">
@@ -447,10 +492,9 @@ function renderCell(title, cell) {
           </div>
         `).join('')}
         <div>
-          ${cell.candidates ? `<div class="meta">Ensemble Candidates ([variant|interp|scale]):</div><div class="ocr-texts">${escapeHtml(JSON.stringify(cell.candidates, null, 2))}</div>` : ''}
-          <div class="meta" style="margin-top:8px">Raw OCR texts:</div>
-          <div class="ocr-texts">${escapeHtml(JSON.stringify(cell.ocr_raw || [], null, 2))}</div>
-          ${cell.parsed_kda?`<div class="meta" style="margin-top:8px">Parsed K/D/A:</div><div class="ocr-texts">${escapeHtml(JSON.stringify(cell.parsed_kda))}</div>`:''}
+          ${ocrRegionsHtml}
+          ${kdaHtml}
+          ${parsedHtml}
           ${cell.error?`<div class="meta" style="margin-top:8px;color:#ef4444">Error</div><div class="ocr-texts" style="color:#fca5a5">${escapeHtml(cell.error)}</div>`:''}
         </div>
       </div>
