@@ -423,6 +423,11 @@ function renderCell(title, cell) {
   if (!cell) return '';
   const imgs = [];
   if (cell.raw_crop) imgs.push({label:'raw crop', src:cell.raw_crop});
+  if (cell.variant_crops) {
+    Object.entries(cell.variant_crops).forEach(([vname, vsrc]) => {
+      imgs.push({label: `variant: ${vname}`, src: vsrc});
+    });
+  }
   if (cell.scaled_4x) imgs.push({label:'scaled 4x (name)', src:cell.scaled_4x});
   if (cell.scaled_5x) imgs.push({label:'scaled 5x (HSR)', src:cell.scaled_5x});
   if (cell.scaled_6x) imgs.push({label:'scaled 6x (numeric)', src:cell.scaled_6x});
@@ -441,7 +446,8 @@ function renderCell(title, cell) {
           </div>
         `).join('')}
         <div>
-          <div class="meta">Raw OCR texts:</div>
+          ${cell.candidates ? `<div class="meta">Ensemble Candidates ([variant|interp|scale]):</div><div class="ocr-texts">${escapeHtml(JSON.stringify(cell.candidates, null, 2))}</div>` : ''}
+          <div class="meta" style="margin-top:8px">Raw OCR texts:</div>
           <div class="ocr-texts">${escapeHtml(JSON.stringify(cell.ocr_raw || [], null, 2))}</div>
           ${cell.parsed_kda?`<div class="meta" style="margin-top:8px">Parsed K/D/A:</div><div class="ocr-texts">${escapeHtml(JSON.stringify(cell.parsed_kda))}</div>`:''}
           ${cell.error?`<div class="meta" style="margin-top:8px;color:#ef4444">Error</div><div class="ocr-texts" style="color:#fca5a5">${escapeHtml(cell.error)}</div>`:''}

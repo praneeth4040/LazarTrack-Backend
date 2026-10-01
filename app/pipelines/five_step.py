@@ -347,6 +347,11 @@ def run_five_step_pipeline(
         interpolations = get_interpolation_methods()
 
         kda_candidates = []
+        variant_crops_encoded = {}
+        for vname, vimg in kda_variants.items():
+            if debug:
+                variant_crops_encoded[vname] = _encode_png(vimg)
+
         # Try primary contrast/sharpened variants with Lanczos & Cubic interpolation at 4x-5x scale
         for var_name in ["contrast", "sharpened", "thresholded", "raw"]:
             img_var = kda_variants.get(var_name, kda_crop)
@@ -360,22 +365,25 @@ def run_five_step_pipeline(
                     )
                     e_res = easy_reader.readtext(scaled_kda, allowlist="0123456789/", detail=0)
                     if e_res:
-                        kda_candidates.append(e_res[0])
+                        kda_candidates.append(f"[{var_name}|{interp_name}|{scale_factor}x]: {e_res[0]}")
 
-        raw_kda = kda_candidates[0] if kda_candidates else ""
-        # Find candidate with 2 slashes or matching 3 numbers
-        for cand in kda_candidates:
+        raw_kda = ""
+        for cand_str in kda_candidates:
+            cand = cand_str.split("]: ", 1)[-1]
             if cand.count('/') == 2 or len(re.sub(r'[^0-9]', '', cand)) == 3:
                 raw_kda = cand
                 break
+        if not raw_kda and kda_candidates:
+            raw_kda = kda_candidates[0].split("]: ", 1)[-1]
 
         kills, _death, assists = _parse_kda_smart(raw_kda)
         if debug:
             p_debug["cells"]["col1_kda"] = {
                 "raw_crop": _encode_png(kda_crop),
-                "scaled_sample": _encode_png(cv2.resize(kda_crop, (kda_crop.shape[1] * 4, kda_crop.shape[0] * 4))),
+                "variant_crops": variant_crops_encoded,
                 "candidates": kda_candidates,
                 "parsed_kda": [kills, _death, assists],
+                "final": f"K={kills} D={_death} A={assists}",
             }
 
         # --- Col 2..8 stat cells ---
