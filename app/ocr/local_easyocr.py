@@ -5,6 +5,7 @@ import httpx
 import easyocr
 from typing import List, Dict, Any, Union
 from app.core.config import settings
+import torch
 
 log = logging.getLogger("app.ocr.remote")
 
@@ -18,7 +19,6 @@ def get_easyocr_reader():
         log.info("Initializing local EasyOCR reader instance (fallback)...")
         use_gpu = False
         try:
-            import torch
             use_gpu = torch.cuda.is_available()
         except Exception as e:
             log.warning("Could not check CUDA GPU availability (%s), defaulting to CPU", e)
@@ -58,6 +58,12 @@ class RemoteEasyOCRWrapper:
                     if resp.status_code == 200:
                         data = resp.json()
                         raw_items = data.get("results", data.get("text", []))
+                        
+                        # Handle string output (e.g. newline-separated text from HF Gradio/FastAPI app)
+                        if isinstance(raw_items, str):
+                            lines = [line.strip() for line in raw_items.splitlines() if line.strip()]
+                            return [([], l, 1.0) for l in lines] if detail != 0 else lines
+
                         if isinstance(raw_items, list):
                             texts = []
                             detailed_items = []
