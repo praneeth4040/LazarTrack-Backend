@@ -11,6 +11,13 @@ class Settings:
 
     EASYOCR_URL: str = os.getenv("EASYOCR_URL", "").strip()
     MAX_IMAGE_BYTES: int = 20 * 1024 * 1024  # 20 MB
+    
+    # Video pipeline configuration
+    VIDEO_OUTPUT_DIR: str = os.getenv(
+        "VIDEO_OUTPUT_DIR", 
+        os.path.join(os.path.dirname(__file__), "..", "..", "video", "output")
+    )
+    OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 
     PLACEHOLDER_URL: str = "http://your-easyocr-server:PORT"
 
@@ -19,6 +26,8 @@ class Settings:
             raise RuntimeError(
                 "EASYOCR_URL environment variable is not configured correctly in .env!"
             )
+        if not self.OPENROUTER_API_KEY:
+            logging.warning("OPENROUTER_API_KEY not set - battle log extraction (step 7) will fail")
 
 settings = Settings()
 

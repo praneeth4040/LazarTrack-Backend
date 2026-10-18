@@ -15,7 +15,7 @@ venv/
 env/
 .venv/
 
-# Environment
+# Environment & secrets
 .env
 *.env
 
@@ -25,9 +25,14 @@ env/
 paddleocr/
 .paddleocr/
 
-# Images (test data)
-img/input/
-img/output/
+# Video pipeline I/O — never commit raw videos or processing output
+video/input/*
+!video/input/.gitkeep
+video/output/*
+!video/output/.gitkeep
+
+# Local test images
+img/
 
 # OS
 .DS_Store

@@ -4,6 +4,7 @@ WORKDIR /app
 
 # Install system dependencies for OpenCV and EasyOCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -20,4 +21,4 @@ COPY . .
 # Port exposed by the app
 EXPOSE 7860
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "7860", "--workers", "2"]
