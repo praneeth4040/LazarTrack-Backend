@@ -7,7 +7,7 @@ router = APIRouter()
 @router.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
     """Health check endpoint returning system status and configured pipeline ID."""
-    pipelines = ["player_stats_extraction"]
+    pipelines = ["player_stats_extraction", "zone_tracker"]
     
     # Check if video pipeline is available
     if hasattr(settings, 'OPENROUTER_API_KEY') and settings.OPENROUTER_API_KEY:

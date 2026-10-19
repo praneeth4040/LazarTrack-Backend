@@ -30,6 +30,9 @@ video/input/*
 !video/input/.gitkeep
 video/output/*
 !video/output/.gitkeep
+!video/output/zone/
+video/output/zone/*/
+!video/output/zone/.gitkeep
 
 # Local test images
 img/
