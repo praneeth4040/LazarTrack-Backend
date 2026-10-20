@@ -23,13 +23,22 @@ v2 improvements
   • Canny-based edge fallback for lit detection
 """
 import argparse
+import concurrent.futures
 import json
+import multiprocessing
 import os
 import cv2
 import numpy as np
 
+# Use 'spawn' start method — safe in Docker/Cloud Run containers where fork() is restricted
+if multiprocessing.get_start_method(allow_none=True) != "spawn":
+    try:
+        multiprocessing.set_start_method("spawn", force=True)
+    except RuntimeError:
+        pass  # Already set by parent process — ignore
+
 try:
-    from app.player_path.circle_fit import ransac_circle, coverage_deg
+    from app.zone_tracker.circle_fit import ransac_circle, coverage_deg
 except ImportError:
     from circle_fit import ransac_circle, coverage_deg
 
@@ -196,8 +205,6 @@ def find_lit_boundary(im, valid, H, H0, base_im, base_valid, s, rmin, rmax):
     c, inl = r
     return {"cx": float(c[0]), "cy": float(c[1]), "r": float(c[2]), "n": int(inl.sum()), "cov": coverage_deg(Pb[inl], c)}, frac
 
-
-import concurrent.futures
 
 _WORKER_CTX = {}
 

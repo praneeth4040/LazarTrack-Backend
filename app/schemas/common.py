@@ -26,5 +26,5 @@ class ExtractionResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    easyocr_url: str
+    ocr_engine: str
     pipelines_available: List[str]

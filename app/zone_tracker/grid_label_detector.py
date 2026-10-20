@@ -17,7 +17,7 @@ import os
 import logging
 from typing import Dict, List, Optional, Tuple
 
-log = logging.getLogger("app.player_path.grid_label_detector")
+log = logging.getLogger("app.zone_tracker.grid_label_detector")
 
 # Grid label identifiers (for debug annotation only)
 TOP_LABELS = list("BCDEFGH")

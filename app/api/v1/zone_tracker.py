@@ -24,7 +24,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.player_path.pipeline import run_player_path_pipeline
+from app.zone_tracker.pipeline import run_player_path_pipeline
 
 log = logging.getLogger("app.api.v1.zone_tracker")
 router = APIRouter(prefix="/zone", tags=["Zone & Map Tracker"])

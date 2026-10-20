@@ -23,16 +23,16 @@ import shutil
 from typing import Any, Dict
 import cv2
 
-from app.player_path.normalizer import PlayerPathNormalizer
-from app.player_path.map_separator import PlayerPathMapSeparator
-from app.player_path.map_cleaner import PlayerPathMapCleaner
-from app.player_path.map_aligner import PlayerPathMapAligner
-from app.player_path.frame_registrar import run as run_frame_registrar, RegistrarConfig
-from app.player_path.zone_detector import run as run_zone_detector
-from app.player_path.zone_clusterer import run as run_zone_clusterer
-from app.player_path.zone_renderer import render_zones_map
+from app.zone_tracker.normalizer import PlayerPathNormalizer
+from app.zone_tracker.map_separator import PlayerPathMapSeparator
+from app.zone_tracker.map_cleaner import PlayerPathMapCleaner
+from app.zone_tracker.map_aligner import PlayerPathMapAligner
+from app.zone_tracker.frame_registrar import run as run_frame_registrar, RegistrarConfig
+from app.zone_tracker.zone_detector import run as run_zone_detector
+from app.zone_tracker.zone_clusterer import run as run_zone_clusterer
+from app.zone_tracker.zone_renderer import render_zones_map
 
-log = logging.getLogger("app.player_path.pipeline")
+log = logging.getLogger("app.zone_tracker.pipeline")
 
 
 class PlayerPathPipelineError(Exception):

@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
-log = logging.getLogger("app.player_path.normalizer")
+log = logging.getLogger("app.zone_tracker.normalizer")
 
 
 @dataclass
@@ -40,7 +40,7 @@ class PlayerPathNormalizer:
         target_height: int = 1080,
         target_fps: Optional[float] = None,
         keep_aspect_ratio: bool = True,
-        output_dir: str = "video/output/player_path/step1",
+        output_dir: str = "video/output/zone/step1",
     ):
         self.target_width = target_width
         self.target_height = target_height

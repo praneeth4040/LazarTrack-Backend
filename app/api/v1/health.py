@@ -6,15 +6,14 @@ router = APIRouter()
 
 @router.get("/health", response_model=HealthResponse, tags=["System"])
 async def health_check():
-    """Health check endpoint returning system status and configured pipeline ID."""
+    """Health check endpoint returning system status and configured pipeline IDs."""
     pipelines = ["player_stats_extraction", "zone_tracker"]
-    
-    # Check if video pipeline is available
-    if hasattr(settings, 'OPENROUTER_API_KEY') and settings.OPENROUTER_API_KEY:
+
+    if settings.OPENROUTER_API_KEY:
         pipelines.append("battle_log_extraction")
-    
+
     return HealthResponse(
         status="ok",
-        easyocr_url=settings.EASYOCR_URL,
+        ocr_engine="local_easyocr",
         pipelines_available=pipelines,
     )

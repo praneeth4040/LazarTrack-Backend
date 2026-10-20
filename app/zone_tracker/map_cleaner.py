@@ -22,7 +22,7 @@ import cv2
 import easyocr
 import numpy as np
 
-log = logging.getLogger("app.player_path.map_cleaner")
+log = logging.getLogger("app.zone_tracker.map_cleaner")
 
 
 @dataclass
@@ -50,7 +50,7 @@ class PlayerPathMapCleaner:
     def __init__(
         self,
         reader: Optional[easyocr.Reader] = None,
-        output_dir: str = "video/output/player_path/step3",
+        output_dir: str = "video/output/zone/step3",
     ):
         self.reader = reader
         self.output_dir = output_dir

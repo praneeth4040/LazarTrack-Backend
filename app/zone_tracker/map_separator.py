@@ -16,7 +16,7 @@ import cv2
 import easyocr
 import numpy as np
 
-log = logging.getLogger("app.player_path.map_separator")
+log = logging.getLogger("app.zone_tracker.map_separator")
 
 
 @dataclass
@@ -38,7 +38,7 @@ class PlayerPathMapSeparator:
         self,
         reader: Optional[easyocr.Reader] = None,
         split_x: int = 960,
-        output_dir: str = "video/output/player_path/step2",
+        output_dir: str = "video/output/zone/step2",
     ):
         self.reader = reader
         self.split_x = split_x

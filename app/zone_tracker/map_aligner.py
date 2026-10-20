@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-log = logging.getLogger("app.player_path.map_aligner")
+log = logging.getLogger("app.zone_tracker.map_aligner")
 
 
 # ------------------------------------------------------------------ results
@@ -56,7 +56,7 @@ class PlayerPathMapAligner:
     def __init__(
         self,
         reference_map_path: str = "assets/maps/bermuda.jpeg",
-        output_dir: str = "video/output/player_path/step4",
+        output_dir: str = "video/output/zone/step4",
     ):
         self.reference_map_path = reference_map_path
         self.output_dir = output_dir

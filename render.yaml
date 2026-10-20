@@ -1,12 +1,17 @@
 services:
   - type: web
     name: lazartrack-backend
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: EASYOCR_URL
-        value: ""   # Not needed — local EasyOCR is used
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: standard          # 2 vCPU / 4 GB — upgrade to pro for full 8-core zone tracker speed
     autoDeploy: true
+    # Cloud Run-style: requests are handled on-demand, container scales to zero when idle
+    disk:
+      name: session-data
+      mountPath: /app/video/output
+      sizeGB: 50
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false         # Set manually in Render dashboard
+      - key: VIDEO_OUTPUT_DIR
+        value: /app/video/output
