@@ -1,9 +1,14 @@
+import os
 import re
 import time
-import numpy as np
-import cv2
+import json
+import base64
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import httpx
 
 from app.ocr.preprocessor import preprocess_image
 from app.ocr.smart_table_detector import (
@@ -12,119 +17,232 @@ from app.ocr.smart_table_detector import (
     split_match_info_and_player_table,
     slice_player_table_columns,
 )
-from app.ocr.local_easyocr import get_easyocr_reader
+from app.core.config import settings
 from app.schemas.common import MatchPlayerStats
 
 log = logging.getLogger("app.pipelines.five_step")
 
-_KNOWN_MAPS = [
-    "Bermuda",
-    "Purgatory", "Kalahari", "Nexterra", "Solara"
-]
+# ========== VL MODEL CONFIGURATION ==========
+VL_MODEL = os.getenv("VL_MODEL", "qwen/qwen3.7-flash")
+VL_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+VL_TEMPERATURE = 0.0
+VL_MAX_TOKENS = 1500
 
-PLAYER_CELLS_Y = [
-    ("Player 1", 165, 225),
-    ("Player 2", 260, 320),
-    ("Player 3", 355, 415),
-    ("Player 4", 450, 510),
-]
+MATCH_STATS_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "map": {
+            "type": "string",
+            "description": "Map name: Bermuda, Purgatory, Kalahari, Nexterra, Solara, or Unknown",
+        },
+        "rank": {
+            "type": "integer",
+            "description": "Placement rank of team (1 if Booyah, or number from #X/Y)",
+        },
+        "total_teams": {
+            "type": "integer",
+            "description": "Total teams count in match (e.g. 11 or 12)",
+        },
+        "players": {
+            "type": "array",
+            "description": "List of active players in the team (up to 4 rows). Skip completely empty or absent rows.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "inGameName": {"type": "string", "description": "Exact in-game player nickname from Column 1"},
+                    "kills": {"type": "integer", "description": "Kills (K from K/D/A in Column 1)"},
+                    "deaths": {"type": "integer", "description": "Deaths (D from K/D/A in Column 1)"},
+                    "assists": {"type": "integer", "description": "Assists (A from K/D/A in Column 1)"},
+                    "damage": {"type": "integer", "description": "Damage dealt (DMG from Column 2)"},
+                    "actualDamage": {"type": "integer", "description": "Actual damage (from Column 3)"},
+                    "knockedDown": {"type": "integer", "description": "Knocked down count (from Column 4)"},
+                    "heal": {"type": "integer", "description": "Heal amount (from Column 5)"},
+                    "helpUp": {"type": "integer", "description": "Help up count (from Column 6)"},
+                    "revival": {"type": "integer", "description": "Revival count (from Column 7)"},
+                    "headShotRate": {"type": "number", "description": "Headshot rate percentage as float without % sign (e.g. 25.0 from Column 8)"},
+                },
+                "required": [
+                    "inGameName",
+                    "kills",
+                    "deaths",
+                    "assists",
+                    "damage",
+                    "actualDamage",
+                    "knockedDown",
+                    "heal",
+                    "helpUp",
+                    "revival",
+                    "headShotRate",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["map", "rank", "total_teams", "players"],
+    "additionalProperties": False,
+}
+
+VL_PROMPT = (
+    "You are an expert Free Fire esports match statistics extractor.\n"
+    "You are given the extracted sections from an end-of-match scoreboard:\n"
+    "- Image 1: Match Header (shows Map name, Placement Rank like #5/11 or Booyah #1, and Total Teams).\n"
+    "- Image 2: Column 1 - Player Info (shows Player In-Game Names and K/D/A 'Kills/Deaths/Assists' for each row).\n"
+    "- Image 3: Column 2 - DMG (Total Damage dealt for each row).\n"
+    "- Image 4: Column 3 - Actual Damage for each row.\n"
+    "- Image 5: Column 4 - Knock Down count for each row.\n"
+    "- Image 6: Column 5 - Heal amount for each row.\n"
+    "- Image 7: Column 6 - Help Up count for each row.\n"
+    "- Image 8: Column 7 - Revival count for each row.\n"
+    "- Image 9: Column 8 - Headshot Rate percentage for each row.\n\n"
+    "Instructions:\n"
+    "1. Extract the map name (one of Bermuda, Purgatory, Kalahari, Nexterra, Solara, or Unknown).\n"
+    "2. Extract the team placement rank and total teams. If 'Booyah' is visible, rank is 1. If format is '#X/Y', rank is X and total_teams is Y.\n"
+    "3. For each active player row (from top to bottom, row 1 to up to 4):\n"
+    "   - inGameName: The exact nickname visible in Column 1. Preserve characters and case.\n"
+    "   - kills: K from K/D/A (first number).\n"
+    "   - deaths: D from K/D/A (second number).\n"
+    "   - assists: A from K/D/A (third number).\n"
+    "   - damage: Integer from Column 2 (ignore progress bar, read digits).\n"
+    "   - actualDamage: Integer from Column 3.\n"
+    "   - knockedDown: Integer from Column 4.\n"
+    "   - heal: Integer from Column 5.\n"
+    "   - helpUp: Integer from Column 6.\n"
+    "   - revival: Integer from Column 7.\n"
+    "   - headShotRate: Float percentage from Column 8 without '%' symbol (e.g. 25.0).\n"
+    "4. Only include active, visible player rows. Skip completely empty or absent player rows.\n"
+    "5. Return strictly valid JSON adhering to the specified schema."
+)
+# ============================================
 
 
-def _parse_kda_smart(raw_str: str) -> Tuple[int, int, int]:
-    if not raw_str:
-        return 0, 0, 0
-    s = re.sub(r'[^0-9/]', '', str(raw_str))
-    parts = [p for p in s.split('/') if p]
-    if len(parts) == 3 and all(p.isdigit() for p in parts):
-        return int(parts[0]), int(parts[1]), int(parts[2])
-    digits = re.sub(r'[^0-9]', '', s)
-    if len(digits) == 3:
-        return int(digits[0]), int(digits[1]), int(digits[2])
-    elif len(digits) == 4 and len(parts) == 2:
-        if len(parts[0]) == 2:
-            return int(parts[0][0]), int(parts[0][1]), int(parts[1])
-        elif len(parts[0]) == 3:
-            return int(parts[0][0]), int(parts[0][1]), int(parts[0][2])
-    elif len(digits) == 2:
-        return int(digits[0]), int(digits[1]), 0
-    elif len(digits) == 1:
-        return int(digits[0]), 0, 0
-    return 0, 0, 0
+def _encode_png_b64(img: np.ndarray) -> str:
+    """Encode an OpenCV BGR image as a base64 data URI."""
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        return ""
+    b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
 
-def _force_digits(raw_str: str) -> int:
-    cleaned = re.sub(r'[^0-9]', '', str(raw_str))
-    return int(cleaned) if cleaned else 0
+def run_vl_stats_extraction(
+    match_info: np.ndarray,
+    column_crops: Dict[str, np.ndarray],
+    api_key: Optional[str] = None,
+    max_retries: int = 2,
+) -> Dict[str, Any]:
+    """
+    Step 5: Sends the 8 column images and match header image directly to the VL model
+    (qwen/qwen3.7-flash via OpenRouter) and retrieves structured output.
+    """
+    key = api_key or os.getenv("OPENROUTER_API_KEY", "") or getattr(settings, "OPENROUTER_API_KEY", "")
+    if not key:
+        raise ValueError("OPENROUTER_API_KEY is not configured in environment or settings")
 
+    # Encode images
+    header_uri = _encode_png_b64(match_info)
+    col1_uri = _encode_png_b64(column_crops.get("col1_player_info", match_info))
+    col2_uri = _encode_png_b64(column_crops.get("col2_dmg", match_info))
+    col3_uri = _encode_png_b64(column_crops.get("col3_actual_damage", match_info))
+    col4_uri = _encode_png_b64(column_crops.get("col4_knockdown", match_info))
+    col5_uri = _encode_png_b64(column_crops.get("col5_heal", match_info))
+    col6_uri = _encode_png_b64(column_crops.get("col6_help_up", match_info))
+    col7_uri = _encode_png_b64(column_crops.get("col7_revival", match_info))
+    col8_uri = _encode_png_b64(column_crops.get("col8_headshot_rate", match_info))
 
-def _force_headshot_rate(raw_str: str) -> float:
-    cleaned = re.sub(r'[^0-9.]', '', str(raw_str))
-    if not cleaned or cleaned == '.':
-        return 0.0
-    try:
-        return float(cleaned)
-    except ValueError:
-        return 0.0
+    content: List[Dict[str, Any]] = [
+        {"type": "text", "text": VL_PROMPT},
+        {"type": "text", "text": "Image 1: Match Header (Map, Rank, Total Teams):"},
+        {"type": "image_url", "image_url": {"url": header_uri}},
+        {"type": "text", "text": "Image 2: Column 1 - Player Info (Names and K/D/A):"},
+        {"type": "image_url", "image_url": {"url": col1_uri}},
+        {"type": "text", "text": "Image 3: Column 2 - DMG (Total Damage):"},
+        {"type": "image_url", "image_url": {"url": col2_uri}},
+        {"type": "text", "text": "Image 4: Column 3 - Actual Damage:"},
+        {"type": "image_url", "image_url": {"url": col3_uri}},
+        {"type": "text", "text": "Image 5: Column 4 - Knock Down:"},
+        {"type": "image_url", "image_url": {"url": col4_uri}},
+        {"type": "text", "text": "Image 6: Column 5 - Heal:"},
+        {"type": "image_url", "image_url": {"url": col5_uri}},
+        {"type": "text", "text": "Image 7: Column 6 - Help Up:"},
+        {"type": "image_url", "image_url": {"url": col6_uri}},
+        {"type": "text", "text": "Image 8: Column 7 - Revival:"},
+        {"type": "image_url", "image_url": {"url": col7_uri}},
+        {"type": "text", "text": "Image 9: Column 8 - Headshot Rate (%):"},
+        {"type": "image_url", "image_url": {"url": col8_uri}},
+    ]
 
+    body = {
+        "model": VL_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": content,
+            }
+        ],
+        "temperature": VL_TEMPERATURE,
+        "max_tokens": VL_MAX_TOKENS,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "match_stats_extraction",
+                "schema": MATCH_STATS_RESPONSE_SCHEMA,
+                "strict": True,
+            },
+        },
+    }
 
-def _extract_rank(rank_str: Optional[str]) -> int:
-    if not rank_str:
-        return 0
-    m = re.search(r'#\s*(\d+)', rank_str)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'(\d+)\s*/\s*\d+', rank_str)
-    if m:
-        return int(m.group(1))
-    m = re.search(r'(?:rank|place)\s*[:\-]?\s*(\d+)', rank_str, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    return 0
+    last_error = None
+    with httpx.Client(timeout=45.0) as client:
+        for attempt in range(1, max_retries + 2):
+            try:
+                log.info("[Step 5] Calling VL model %s (attempt %d)...", VL_MODEL, attempt)
+                res = client.post(
+                    VL_API_URL,
+                    headers={
+                        "Authorization": f"Bearer {key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                )
 
+                if res.status_code == 200:
+                    resp_json = res.json()
+                    raw_text = resp_json["choices"][0]["message"]["content"].strip()
+                    log.info("[Step 5] VL model response received (%d chars)", len(raw_text))
+                    parsed = json.loads(raw_text)
+                    return parsed
+                elif res.status_code in (429, 500, 502, 503, 504):
+                    log.warning("[Step 5] Transient API status %d: %s. Retrying...", res.status_code, res.text[:200])
+                    time.sleep(1.5 * attempt)
+                    continue
+                else:
+                    raise ValueError(f"OpenRouter API returned HTTP {res.status_code}: {res.text[:300]}")
+            except Exception as e:
+                last_error = e
+                log.warning("[Step 5] Attempt %d failed: %s", attempt, e)
+                if attempt <= max_retries:
+                    time.sleep(1.5 * attempt)
 
-def _extract_total_teams(rank_str: Optional[str]) -> int:
-    if not rank_str:
-        return 12
-    m = re.search(r'/\s*(\d+)', rank_str)
-    if m:
-        return int(m.group(1))
-    return 12
+    raise RuntimeError(f"Step 5 VL model extraction failed after retries: {last_error}")
 
 
 def run_five_step_pipeline(
     raw_bytes: bytes,
     easy_reader=None,
+    api_key: Optional[str] = None,
     debug: bool = False,
 ) -> Dict[str, Any]:
     """
-    Runs the full 5-step Free Fire match extraction pipeline on raw image bytes.
-
-    Args:
-        raw_bytes: Uploaded screenshot bytes.
-        easy_reader: Optional pre-instantiated EasyOCR reader (for reuse).
-        debug: If True, the returned dict also contains a "steps" key with
-               per-step results (crop images encoded as base64 data URIs,
-               OCR texts, metadata, per-player per-cell OCR debug rows).
-
-    Returns:
-        Dict with keys: map, rank, total_teams, players, metadata.
-        When debug=True, additionally contains: "steps" (list of step dicts).
+    Runs the 5-step Free Fire match extraction pipeline:
+      - Step 1: Normalization (1920w target)
+      - Step 2: Smart Table ROI Detection (Diagonal Anchors, 1560x1040)
+      - Step 3: STATS button removal & Section split (Match Info & Player Table)
+      - Step 4: Column Grid Slicing (Slices into the 8 stat columns)
+      - Step 5: VL Model Multi-Column Extraction (qwen/qwen3.7-flash structured output)
     """
     t_start = time.time()
-
-    if easy_reader is None:
-        easy_reader = get_easyocr_reader()
-
     metadata: Dict[str, Any] = {}
     debug_steps: List[Dict[str, Any]] = []
-
-    def _encode_png(img: np.ndarray) -> str:
-        ok, buf = cv2.imencode(".png", img)
-        if not ok:
-            return ""
-        import base64
-        b64 = base64.b64encode(buf.tobytes()).decode("ascii")
-        return f"data:image/png;base64,{b64}"
 
     # ------------------------------------------------------------
     # STEP 1: Normalization (1920w target)
@@ -146,7 +264,7 @@ def run_five_step_pipeline(
             "width": w,
             "height": h,
             "target_width": 1920,
-            "image": _encode_png(normalized_img),
+            "image": _encode_png_b64(normalized_img),
         })
 
     # ------------------------------------------------------------
@@ -168,7 +286,7 @@ def run_five_step_pipeline(
             "width": w,
             "height": h,
             "meta": meta2,
-            "image": _encode_png(table_crop),
+            "image": _encode_png_b64(table_crop),
         })
 
     # ------------------------------------------------------------
@@ -179,10 +297,8 @@ def run_five_step_pipeline(
     metadata["stats_button"] = meta3a
 
     match_info, player_table, meta3b = split_match_info_and_player_table(
-        tighter_crop, reader=easy_reader
+        tighter_crop, use_ocr=False
     )
-    detected_rank = meta3b.get("detected_rank")
-    detected_tagline = meta3b.get("detected_tagline")
     metadata["split"] = meta3b
     step3_dur = round(time.time() - step3_t, 3)
 
@@ -193,81 +309,18 @@ def run_five_step_pipeline(
             "duration_seconds": step3_dur,
             "stats_button_meta": meta3a,
             "split_meta": meta3b,
-            "detected_rank": detected_rank,
-            "detected_tagline": detected_tagline,
             "images": {
-                "tighter_crop": _encode_png(tighter_crop),
-                "match_info": _encode_png(match_info),
-                "player_table": _encode_png(player_table),
+                "tighter_crop": _encode_png_b64(tighter_crop),
+                "match_info": _encode_png_b64(match_info),
+                "player_table": _encode_png_b64(player_table),
             },
         })
 
     # ------------------------------------------------------------
-    # Extract map from match info (lightweight EasyOCR)
-    # ------------------------------------------------------------
-    from difflib import SequenceMatcher
-    try:
-        map_ocr_texts = easy_reader.readtext(match_info, detail=0)
-        joined = " ".join(map_ocr_texts)
-
-        best_score = 0.0
-        best_map = "Unknown"
-
-        for word in joined.split():
-            clean_word = re.sub(r'[^a-zA-Z]', '', word)
-            if not clean_word:
-                continue
-            for name in _KNOWN_MAPS:
-                # Direct match check first
-                if clean_word.lower() == name.lower():
-                    best_score = 1.0
-                    best_map = name
-                    break
-                # Fuzzy similarity score check
-                ratio = SequenceMatcher(None, clean_word.lower(), name.lower()).ratio()
-                if ratio >= 0.80 and ratio > best_score:
-                    best_score = ratio
-                    best_map = name
-
-            if best_score == 1.0:
-                break
-
-        map_name = best_map
-    except Exception as e:
-        log.warning("Map detection OCR failed: %s", e)
-
-    # Rank + total_teams
-    if detected_tagline:
-        joined_tag = str(detected_tagline).lower()
-        if "booyah" in joined_tag:
-            rank = 1
-        else:
-            rank = _extract_rank(detected_rank)
-    else:
-        rank = _extract_rank(detected_rank)
-
-    total_teams = _extract_total_teams(detected_rank)
-
-    # Also check if any match_texts contain "booyah" -> rank=1
-    if rank == 0:
-        for t in map_ocr_texts:
-            if re.search(r"booyah", t, re.IGNORECASE):
-                rank = 1
-                break
-        if rank == 0:
-            joined = " ".join(map_ocr_texts)
-            m = re.search(r"#\s*(\d+)", joined)
-            if m:
-                rank = int(m.group(1))
-                m2 = re.search(r"/\s*(\d+)", joined)
-                if m2:
-                    total_teams = int(m2.group(1))
-
-    # ------------------------------------------------------------
-    # STEP 4: Column grid identification & slicing
+    # STEP 4: Column grid identification & slicing (8 columns)
     # ------------------------------------------------------------
     step4_t = time.time()
-    column_crops, _, meta4 = slice_player_table_columns(player_table)
+    column_crops, annotated_grid, meta4 = slice_player_table_columns(player_table)
     metadata["columns"] = {
         "num_columns": meta4["num_columns"],
         "width": meta4["table_width"],
@@ -279,8 +332,8 @@ def run_five_step_pipeline(
         col_images: Dict[str, str] = {}
         for c in meta4.get("columns", []):
             key = c["key"]
-            crop = player_table[:, c["x_start"]:c["x_end"]]
-            col_images[key] = _encode_png(crop)
+            if key in column_crops:
+                col_images[key] = _encode_png_b64(column_crops[key])
         debug_steps.append({
             "step": 4,
             "name": "Column Grid Slicing",
@@ -293,203 +346,58 @@ def run_five_step_pipeline(
         })
 
     # ------------------------------------------------------------
-    # STEP 5: Per-player per-cell super-scale OCR
+    # STEP 5: VL Model Multi-Column Structured Extraction
     # ------------------------------------------------------------
     step5_t = time.time()
-    structured_players: List[MatchPlayerStats] = []
-    col_defs = {c["key"]: (c["x_start"], c["x_end"]) for c in meta4["columns"]}
-
-    debug_players: List[Dict[str, Any]] = []
-
-    for p_label, y1, y2 in PLAYER_CELLS_Y:
-        p_debug: Dict[str, Any] = {
-            "label": p_label,
-            "y_start": y1,
-            "y_end": y2,
-            "cells": {},
-        }
-
-        # Empty slot detection using column 1
-        c1_xs, c1_xe = col_defs["col1_player_info"]
-        c1_crop_raw = player_table[y1 : y2 + 30, c1_xs:c1_xe]
-        try:
-            gray_c1 = cv2.cvtColor(c1_crop_raw, cv2.COLOR_BGR2GRAY)
-            std_val = float(np.std(gray_c1))
-        except Exception:
-            continue
-        # Preflight: send raw crop to /ocr/detail — server upscales at 4x contrast
-        c1_ocr_res = easy_reader.readtext(c1_crop_raw, detail=1, preprocess="contrast", scale=4)
-
-        p_debug["preflight_std"] = std_val
-        p_debug["preflight_ocr_items"] = len(c1_ocr_res)
-
-        if not c1_ocr_res or std_val < 20.0:
-            log.info("Slot %s is empty (std=%.1f, ocr_items=%d). Skipping.",
-                     p_label, std_val, len(c1_ocr_res))
-            p_debug["empty"] = True
-            if debug:
-                debug_players.append(p_debug)
-            continue
-
-        p_debug["empty"] = False
-
-        # Dual-region col 1: name (top 55%) + KDA (bottom)
-        h_c1 = c1_crop_raw.shape[0]
-        name_crop = c1_crop_raw[0 : int(h_c1 * 0.55), :]
-        kda_crop = c1_crop_raw[int(h_c1 * 0.48) :, :]
-
-        # --- Name: send raw crop, server applies contrast+4x ---
-        e_name_results = easy_reader.readtext(name_crop, detail=1, preprocess="contrast", scale=4)
-        e_names = [text for (_, text, _) in e_name_results]
-        full_ign = " ".join(e_names).strip() if e_names else "Unknown"
-        if not full_ign:
-            full_ign = "Unknown"
-        if debug:
-            p_debug["cells"]["col1_name"] = {
-                "raw_crop": _encode_png(name_crop),
-                "ocr_regions": [(text, round(conf, 3)) for (_, text, conf) in e_name_results],
-                "final": full_ign,
-            }
-
-        # --- K/D/A: single call to /ocr/detail, regex search for nn/nn/nn ---
-        # No client-side preprocessing — server applies contrast+4x
-        kda_ocr_results = easy_reader.readtext(
-            kda_crop, allowlist="0123456789/", detail=1, preprocess="contrast", scale=4
-        )
-
-        # Join all detected text regions and search for exact K/D/A pattern
-        joined_kda = " ".join(
-            text for (_, text, _) in kda_ocr_results
-            if isinstance(text, str)
-        )
-        kda_match = re.search(r'(\d{1,2})/(\d{1,2})/(\d{1,2})', joined_kda)
-
-        if kda_match:
-            kills, _death, assists = int(kda_match.group(1)), int(kda_match.group(2)), int(kda_match.group(3))
-            kda_conf = 1.0
-            raw_kda = kda_match.group(0)
-        else:
-            raw_kda = joined_kda.strip()
-            kills, _death, assists = _parse_kda_smart(raw_kda)
-            kda_conf = 0.5 if raw_kda else 0.0
-
-        if debug:
-            p_debug["cells"]["col1_kda"] = {
-                "raw_crop": _encode_png(kda_crop),
-                "ocr_regions": [(text, round(conf, 3)) for (_, text, conf) in kda_ocr_results],
-                "joined": joined_kda,
-                "pattern_matched": kda_match is not None,
-                "raw_kda": raw_kda,
-                "kda_conf": kda_conf,
-                "parsed_kda": [kills, _death, assists],
-                "final": f"K={kills} D={_death} A={assists}",
-            }
-
-        # --- Col 2..8 stat cells ---
-        col2_damage = 0
-        col3_actual_damage = 0
-        col4_knockdown = 0
-        col5_heal = 0
-        col6_help_up = 0
-        col7_revival = 0
-        col8_hsr = 0.0
-
-        for col_info in meta4["columns"]:
-            key = col_info["key"]
-            if key == "col1_player_info":
-                continue
-            xs, xe = col_info["x_start"], col_info["x_end"]
-            w_cell = xe - xs
-
-            if key == "col8_headshot_rate":
-                cell_crop = player_table[y1 + 5 : y2 + 25, xs:xe]
-                cell_debug: Dict[str, Any] = {"raw_crop": _encode_png(cell_crop) if debug else ""}
-                try:
-                    # Server applies contrast+5x upscale
-                    e_res = easy_reader.readtext(
-                        cell_crop, allowlist="0123456789.%", detail=1,
-                        preprocess="contrast", scale=5
-                    )
-                    if e_res:
-                        col8_hsr = _force_headshot_rate(e_res[0][1])
-                    cell_debug["ocr_regions"] = [(text, round(conf, 3)) for (_, text, conf) in e_res]
-                    cell_debug["final"] = col8_hsr
-                except Exception as ex:
-                    cell_debug["error"] = str(ex)
-                if debug:
-                    p_debug["cells"][key] = cell_debug
-            else:
-                # Columns 2..7: left 48% only (skip progress bars)
-                crop_w = int(w_cell * 0.48)
-                cell_crop = player_table[y1 : y2 - 10, xs : xs + crop_w]
-                cell_debug = {"raw_crop": _encode_png(cell_crop) if debug else "", "left_48_only": True}
-                try:
-                    # Server applies contrast+6x upscale
-                    e_res = easy_reader.readtext(
-                        cell_crop, allowlist="0123456789", detail=1,
-                        preprocess="contrast", scale=6
-                    )
-                    val_str = e_res[0][1].strip() if (e_res and e_res[0][1].strip()) else "0"
-                    val = _force_digits(val_str)
-                    cell_debug["ocr_regions"] = [(text, round(conf, 3)) for (_, text, conf) in e_res]
-                    cell_debug["final"] = val
-                    if key == "col2_dmg":
-                        col2_damage = val
-                    elif key == "col3_actual_damage":
-                        col3_actual_damage = val
-                    elif key == "col4_knockdown":
-                        col4_knockdown = val
-                    elif key == "col5_heal":
-                        col5_heal = val
-                    elif key == "col6_help_up":
-                        col6_help_up = val
-                    elif key == "col7_revival":
-                        col7_revival = val
-                except Exception as ex:
-                    cell_debug["error"] = str(ex)
-                if debug:
-                    p_debug["cells"][key] = cell_debug
-
-        structured_players.append(MatchPlayerStats(
-            inGameName=full_ign,
-            kills=kills,
-            deaths=_death,
-            assists=assists,
-            damage=col2_damage,
-            actualDamage=col3_actual_damage,
-            revival=col7_revival,
-            knockedDown=col4_knockdown,
-            heal=col5_heal,
-            helpUp=col6_help_up,
-            headShotRate=col8_hsr,
-        ))
-
-        if debug:
-            p_debug["final"] = structured_players[-1].model_dump()
-            debug_players.append(p_debug)
-
+    vl_result = run_vl_stats_extraction(
+        match_info=match_info,
+        column_crops=column_crops,
+        api_key=api_key,
+    )
     step5_dur = round(time.time() - step5_t, 3)
+
+    raw_players = vl_result.get("players", [])
+    structured_players: List[MatchPlayerStats] = []
+    for p in raw_players:
+        structured_players.append(
+            MatchPlayerStats(
+                inGameName=p.get("inGameName", "Unknown"),
+                kills=int(p.get("kills", 0)),
+                deaths=int(p.get("deaths", 0)),
+                assists=int(p.get("assists", 0)),
+                damage=int(p.get("damage", 0)),
+                actualDamage=int(p.get("actualDamage", 0)),
+                knockedDown=int(p.get("knockedDown", 0)),
+                heal=int(p.get("heal", 0)),
+                helpUp=int(p.get("helpUp", 0)),
+                revival=int(p.get("revival", 0)),
+                headShotRate=float(p.get("headShotRate", 0.0)),
+            )
+        )
+
+    map_name = vl_result.get("map", "Unknown")
+    rank = int(vl_result.get("rank", 1))
+    total_teams = int(vl_result.get("total_teams", 12))
+
     if debug:
         debug_steps.append({
             "step": 5,
-            "name": "Per-Cell Super-Scale OCR",
+            "name": "VL Model Multi-Column Extraction (Qwen 3.7 Flash)",
             "duration_seconds": step5_dur,
-            "player_cells_y": PLAYER_CELLS_Y,
+            "model": VL_MODEL,
             "num_players": len(structured_players),
-            "players": debug_players,
+            "vl_result": vl_result,
         })
 
     elapsed = time.time() - t_start
     metadata["elapsed_seconds"] = round(elapsed, 3)
-    metadata["detected_rank"] = detected_rank
-    metadata["detected_tagline"] = detected_tagline
-    metadata["map_ocr_texts"] = map_ocr_texts
+    metadata["model"] = VL_MODEL
     metadata["step_durations"] = {
         "step1_normalization": step1_dur,
         "step2_smart_roi": step2_dur,
         "step3_section_split": step3_dur,
         "step4_column_slice": step4_dur,
-        "step5_per_cell_ocr": step5_dur,
+        "step5_vl_extraction": step5_dur,
     }
 
     result: Dict[str, Any] = {
@@ -504,7 +412,7 @@ def run_five_step_pipeline(
         result["steps"] = debug_steps
 
     log.info(
-        "5-step pipeline completed in %.2fs: map=%s rank=%d teams=%d players=%d",
+        "5-step VL pipeline completed in %.2fs: map=%s rank=%d teams=%d players=%d",
         elapsed, map_name, result["rank"], result["total_teams"], len(structured_players)
     )
 

@@ -14,6 +14,6 @@ async def health_check():
 
     return HealthResponse(
         status="ok",
-        ocr_engine="local_easyocr",
+        ocr_engine="qwen_vl_openrouter",
         pipelines_available=pipelines,
     )

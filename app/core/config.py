@@ -2,7 +2,11 @@ import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+_backend_env = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+if os.path.exists(_backend_env):
+    load_dotenv(_backend_env)
+else:
+    load_dotenv()
 
 class Settings:
     PROJECT_NAME: str = "LazarTrack Intelligent Extraction Agent"

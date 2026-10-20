@@ -167,53 +167,54 @@ def detect_stats_button_crop(table_crop: np.ndarray) -> Tuple[np.ndarray, Dict[s
     return tighter_crop, metadata
 
 
-def split_match_info_and_player_table(table_crop: np.ndarray, reader=None) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def split_match_info_and_player_table(table_crop: np.ndarray, reader=None, use_ocr: bool = False) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
-    STEP 3: Dynamic OCR-based Rank & Tagline Anchor Detection.
-    Detects the Rank (e.g. #5/11, #9/12) and Tagline text (e.g. "CLOSE, BUT NO CIGAR!",
-    "YOU MADE IT TO THE TOP 10!") using OCR in the upper region (Y=40 to 320).
-    Sets split_y dynamically right below the detected tagline bounding box.
+    STEP 3: Rank & Tagline Section Split.
+    Splits the 1560x1040 table at split_y=285 into match_info_section (header)
+    and player_table_section (body rows). If use_ocr is True and reader is provided,
+    scans top region for dynamic rank/tagline anchors.
     """
     h, w = table_crop.shape[:2]
-    split_y = 285  # Fallback anchor Y
+    split_y = 285  # Standard anchor Y for 1560x1040 canvas
     detected_rank = None
     detected_tagline = None
 
-    try:
-        if reader is None:
-            from app.ocr.local_easyocr import get_easyocr_reader
-            reader = get_easyocr_reader()
+    if use_ocr:
+        try:
+            if reader is None:
+                from app.ocr.local_easyocr import get_easyocr_reader
+                reader = get_easyocr_reader()
 
-        # Scan top region Y = 40 to 320 for Rank & Tagline text
-        top_region = table_crop[40:320, :]
-        results = reader.readtext(top_region, detail=1)
+            # Scan top region Y = 40 to 320 for Rank & Tagline text
+            top_region = table_crop[40:320, :]
+            results = reader.readtext(top_region, detail=1)
 
-        tagline_bottom_y = 0
-        for bbox, text, conf in results:
-            # Guard: skip results with no usable bbox coordinates (e.g. from plain-string remote responses)
-            if not bbox or len(bbox) < 3:
-                continue
-            abs_y1 = 40 + int(bbox[0][1])
-            abs_y2 = 40 + int(bbox[2][1])
-            txt_upper = text.strip().upper()
+            tagline_bottom_y = 0
+            for bbox, text, conf in results:
+                # Guard: skip results with no usable bbox coordinates (e.g. from plain-string remote responses)
+                if not bbox or len(bbox) < 3:
+                    continue
+                abs_y1 = 40 + int(bbox[0][1])
+                abs_y2 = 40 + int(bbox[2][1])
+                txt_upper = text.strip().upper()
 
-            # Rank detection (e.g. #5/11, #9/12)
-            if ('#' in text or '/' in text) and abs_y1 < 250 and conf > 0.4:
-                detected_rank = text.strip()
+                # Rank detection (e.g. #5/11, #9/12)
+                if ('#' in text or '/' in text) and abs_y1 < 250 and conf > 0.4:
+                    detected_rank = text.strip()
 
-            # Dynamic Tagline detection right below rank (Y=200..290)
-            elif abs_y1 > 180 and abs_y2 < 300 and conf > 0.3:
-                detected_tagline = text.strip()
-                if abs_y2 > tagline_bottom_y:
-                    tagline_bottom_y = abs_y2
+                # Dynamic Tagline detection right below rank (Y=200..290)
+                elif abs_y1 > 180 and abs_y2 < 300 and conf > 0.3:
+                    detected_tagline = text.strip()
+                    if abs_y2 > tagline_bottom_y:
+                        tagline_bottom_y = abs_y2
 
-        if tagline_bottom_y > 240:
-            split_y = tagline_bottom_y + 5
+            if tagline_bottom_y > 240:
+                split_y = tagline_bottom_y + 5
 
-        log.info(f"[Step 3 OCR Anchor] Rank='{detected_rank}', Tagline='{detected_tagline}' -> split_y={split_y}")
-    except Exception as e:
-        log.warning(f"[Step 3 OCR Anchor] Fallback to Y=285 due to OCR exception: {e}")
-        split_y = 285
+            log.info(f"[Step 3 OCR Anchor] Rank='{detected_rank}', Tagline='{detected_tagline}' -> split_y={split_y}")
+        except Exception as e:
+            log.warning(f"[Step 3 OCR Anchor] Fallback to Y=285 due to OCR exception: {e}")
+            split_y = 285
 
     match_info_section = table_crop[:split_y, :]
     player_table_section = table_crop[split_y:, :]

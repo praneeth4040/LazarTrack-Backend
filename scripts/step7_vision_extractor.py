@@ -244,8 +244,11 @@ def load_roster(roster_dir, video_id):
     
     # Try step3 pipeline format first: {roster_dir}/{video_id}/players.json
     step3_path = os.path.join(roster_dir, str(video_id), "players.json")
+    direct_path = os.path.join(roster_dir, "players.json")
     if os.path.exists(step3_path):
         path = step3_path
+    elif os.path.exists(direct_path):
+        path = direct_path
     else:
         # Fall back to legacy format: {roster_dir}/{video_id}.json
         path = os.path.join(roster_dir, f"{video_id}.json")

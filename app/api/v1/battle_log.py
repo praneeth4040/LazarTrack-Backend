@@ -12,10 +12,10 @@ import uuid
 from typing import List, Optional
 from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.pipelines.video_pipeline import run_complete_video_pipeline
+from app.pipelines.video_pipeline import run_complete_video_pipeline, run_step7_on_session
 
 log = logging.getLogger("app.api.v1.battle_log")
 router = APIRouter(prefix="/battle-log", tags=["Battle Log"])
@@ -44,10 +44,10 @@ class BattleLogResponse(BaseModel):
     """Complete battle log extraction response"""
     success: bool
     video_id: str
-    events: List[BattleLogEvent]
-    team_slots: dict
-    metadata: dict
-    download_urls: dict
+    events: List[BattleLogEvent] = Field(default_factory=list)
+    team_slots: dict = Field(default_factory=dict)
+    metadata: dict = Field(default_factory=dict)
+    download_urls: dict = Field(default_factory=dict)
 
 
 async def _validate_video_file(file: UploadFile) -> bytes:
@@ -134,16 +134,17 @@ async def extract_battle_log(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Free Fire battle log video"),
     cleanup_intermediate: bool = True,
-    auto_cleanup_hours: int = 24
+    auto_cleanup_hours: int = 24,
+    run_step7: bool = False,
 ):
     """
-    Extract battle log events from a Free Fire video.
-    Runs non-blocking in worker threadpool and persists session deliverables.
+    Extract battle log deliverables (group images, map video, team image) from a video.
+    Stops at Step 6 by default (run_step7=False). Step 7 can be triggered on demand.
     """
     raw_video = await _validate_video_file(file)
     video_id = str(uuid.uuid4())[:8]
     
-    log.info(f"[battle-log/extract] Processing '{file.filename}' as video_id={video_id}")
+    log.info(f"[battle-log/extract] Processing '{file.filename}' as video_id={video_id} (run_step7={run_step7})")
     
     temp_dir = tempfile.mkdtemp(prefix=f"video_{video_id}_")
     input_video_path = os.path.join(temp_dir, f"input_{video_id}.mp4")
@@ -161,7 +162,8 @@ async def extract_battle_log(
             video_path=input_video_path,
             video_id=video_id,
             output_base_dir=output_base_dir,
-            cleanup_intermediate=cleanup_intermediate
+            cleanup_intermediate=cleanup_intermediate,
+            run_step7=run_step7,
         )
         
         if not result["success"]:
@@ -195,9 +197,9 @@ async def extract_battle_log(
         return BattleLogResponse(
             success=True,
             video_id=video_id,
-            events=[BattleLogEvent(**event) for event in result["events"]],
-            team_slots=result["team_slots"],
-            metadata=result["metadata"],
+            events=[BattleLogEvent(**event) for event in result.get("events", [])],
+            team_slots=result.get("team_slots", {}),
+            metadata=result.get("metadata", {}),
             download_urls={
                 "group_images": f"/api/v1/battle-log/{video_id}/group-images",
                 "map_video": f"/api/v1/battle-log/{video_id}/map-video" if result.get("map_video_path") else None,
@@ -214,6 +216,33 @@ async def extract_battle_log(
     finally:
         if os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
+
+
+@router.post("/{video_id}/extract-events", summary="Run Step 7 Vision extraction on-demand (Admin)")
+async def extract_events_on_demand(video_id: str):
+    """
+    On-demand Step 7 execution:
+    Runs the Vision Language model on the existing Step 6 group images in the session.
+    Used by admin portal or downstream suggestion engine builder.
+    """
+    session = _get_pipeline_output(video_id)
+    output_base_dir = session.get("output_dir")
+    if not output_base_dir or not os.path.exists(output_base_dir):
+        raise HTTPException(status_code=404, detail="Session directory not found")
+
+    result = await asyncio.to_thread(
+        run_step7_on_session,
+        session_dir_path=output_base_dir,
+        video_id=video_id,
+    )
+
+    # Reload session info with newly generated events
+    events_file = os.path.join(output_base_dir, "events.json")
+    if os.path.exists(events_file):
+        session["events_file"] = events_file
+        PIPELINE_OUTPUTS[video_id] = session
+
+    return result
 
 
 @router.get("/{video_id}/group-images")

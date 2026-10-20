@@ -6,18 +6,34 @@ colorTo: purple
 sdk: docker
 pinned: false
 license: mit
-short_description: Free Fire esports analysis — Battle Log Extraction & Zone Tracker
+short_description: Free Fire esports analysis — Player Stats, Battle Log & Zone Tracker
 ---
 
 # 🎯 LazarTrack Backend
 
-Production-grade, end-to-end video analysis suite for Free Fire esports matches.  
-Two independent pipelines:
+Production-grade, end-to-end computer vision and multimodal AI analytics suite for competitive Free Fire esports matches.
 
-| Pipeline | What It Does |
-|---|---|
-| **Battle Log Extractor** | Extracts structured kill/elimination events from battle log video |
-| **Zone Tracker** | Detects and renders all safe-zone circles onto the minimap |
+---
+
+## 📑 In-Depth Documentation
+
+Comprehensive technical documentation is maintained in the [`docs/`](docs/README.md) directory:
+
+- 🏛️ **[System Architecture](docs/SYSTEM_ARCHITECTURE.md)**: End-to-end design, data flows, and external AI models.
+- 📊 **[Player Stats Extraction Pipeline](docs/PLAYER_STATS_PIPELINE.md)**: 5-step scoreboard extraction via OpenCV and Qwen 3.7 Flash.
+- ⚔️ **[Battle Log Video Pipeline](docs/BATTLE_LOG_PIPELINE.md)**: 7-step video engine with decoupled on-demand vision extraction.
+- 🗺️ **[Zone Tracker Pipeline](docs/ZONE_TRACKER_PIPELINE.md)**: 8-step minimap SIFT alignment and safe-zone detection.
+- 📡 **[REST API Reference](docs/API_REFERENCE.md)**: Full endpoint reference, schemas, and curl examples.
+
+---
+
+## 🚀 The Three Core Intelligence Pipelines
+
+| Pipeline | Code | Input | Output | Model / Tech |
+|---|---|---|---|---|
+| **Player Stats Extraction** | `PSE-001` | Scoreboard Screenshot (PNG/JPG) | Structured Match Stats JSON (`map`, `rank`, `players[]` with 10 metrics) | OpenCV + `qwen/qwen3.7-flash` (via OpenRouter) |
+| **Battle Log Extractor** | `BLE-001` | Match Recording Video (MP4/MOV) | Isolated Minimap Video (`map_video.mp4`), Event Groups (`group_*.png`), and On-Demand Events (`events.json`) | FFmpeg + OpenCV + SSIM + Qwen 3.7 Flash |
+| **Zone Tracker** | `ZTE-001` | Match Video + Map Name | Rendered Zone Map (`rendered_map.png`) & Circle Coordinates (`zones.json`) | SIFT Homography + Hough Transform + DBSCAN |
 
 ---
 
@@ -43,11 +59,8 @@ Output: rendered_map.png (zones overlaid on reference map)
         zones.json       (centre x/y, radius, confidence per zone)
 ```
 
-### Running via API
+### Zone Tracker API Examples
 ```bash
-# Start server
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-
 # Process a match video
 curl -X POST http://localhost:8000/api/v1/zone/process \
   -F "file=@match.mp4" \
@@ -60,90 +73,89 @@ curl http://localhost:8000/api/v1/zone/{video_id}/zones-map --output map.png
 open http://localhost:8000/api/v1/zone/{video_id}/visual
 ```
 
-### Running via script (batch)
-```bash
-python3 scripts/run_all_zone_pipeline.py
-```
-
-### Supported Maps
-Reference map images live in `assets/maps/`:
-- `bermuda` · `purgatory` · `kalahari` · `solara` · `nexterra`
-
 ---
 
-## 📋 Battle Log Extractor — 7-Step Pipeline
+## ⚔️ Battle Log Extractor — 7-Step Decoupled Pipeline
 
-Extracts structured kill/death events from Free Fire battle log video overlay.
+Extracts structured kill/death events from the Free Fire battle log video overlay.
 
 ```
 Input Video (MP4 / MOV / AVI)
       │
       ▼
 Step 1 │ Normalizer        Scale to 1920×1080 @ 5 FPS via FFmpeg
-Step 2 │ Separator         Multi-frame scan for "BATTLE LOG" header
-       │                   Splits into: Battle Log (960×499) + Map (760×760)
-Step 3 │ Player Identifier Extract team roster & player slots via Qwen VL
-Step 4 │ Row Divider       Segment battle log into 8 horizontal slot rows
-Step 5 │ Event Tracker     Track multi-row entry/exit lifecycle & dedup events
-Step 6 │ Group Packer      Pack 8 deduplicated event crops per group image
-Step 7 │ Vision Extractor  Structured JSON events via vision model
+Step 2 │ Separator         Locates "BATTLE LOG" header; splits Battle Log (960×499) + Map (760×760)
+Step 3 │ Player Identifier Extracts team roster frame (team_image.png) & player IGNs (players.json)
+Step 4 │ Row Divider       Segments battle log into 8 horizontal slot rows
+Step 5 │ Event Tracker     Tracks multi-row lifecycle & deduplicates repetitive frames
+Step 6 │ Group Packer      Packs 8 deduplicated event crops into composite group cards (group_*.png)
       │
-      ▼
-Output: events.json + map_video.mp4 + team_image.png + group_images/
+      ├───────────────────► USER DELIVERABLES RETURNED (~30s)
+      │                     (group_*.png, map_video.mp4, team_image.png)
+      │
+Step 7 │ Vision Extractor  [ON-DEMAND ADMIN CALL] Qwen 3.7 Flash structured transcription (events.json)
 ```
 
-### Running the battle log pipeline
+### Battle Log API Examples
 ```bash
-python3 -c "
-from app.pipelines.video_pipeline import run_complete_video_pipeline
-result = run_complete_video_pipeline('video/input/1.mp4', video_id='match_1', output_base_dir='video/output/match_1')
-print('Events:', len(result['events']))
-"
+# 1. Upload video — runs Steps 1–6 automatically (~30s)
+curl -X POST http://localhost:8000/api/v1/battle-log/extract \
+  -F "file=@match.mp4"
+
+# 2. Trigger Step 7 on-demand (Admin portal / suggestion engine builder)
+curl -X POST http://localhost:8000/api/v1/battle-log/{video_id}/extract-events
+
+# 3. Download structured events JSON
+curl http://localhost:8000/api/v1/battle-log/{video_id}/events.json
 ```
 
 ---
 
-## 🌐 REST API Endpoints
+## 📊 Player Stats Extraction — 5-Step Pipeline
+
+Extracts all 10 in-game player combat stats with 100% precision from post-match scoreboard screenshots.
+
+```bash
+# Extract match stats from screenshot
+curl -X POST http://localhost:8000/api/v1/pipeline/match_stats \
+  -F "file=@assets/sample_scoreboard.png"
+
+# Visual debug UI
+open http://localhost:8000/api/v1/visualize
+```
+
+---
+
+## 🌐 REST API Directory
 
 Start the server:
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Zone Tracker
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v1/zone/process` | Upload MP4 or provide `video_path` + `map_name` |
-| `GET` | `/api/v1/zone/list` | List all processed sessions |
-| `GET` | `/api/v1/zone/maps` | List supported map templates |
-| `GET` | `/api/v1/zone/{id}/status` | Session processing status |
-| `GET` | `/api/v1/zone/{id}/zones` | Raw zone JSON (centre, radius, confidence) |
-| `GET` | `/api/v1/zone/{id}/zones-map` | Rendered PNG map with zones |
-| `GET` | `/api/v1/zone/{id}/step/{n}/{artifact}` | Download step artifact file |
-| `GET` | `/api/v1/zone/{id}/visual` | Interactive 8-step visual inspection dashboard |
-
-### Battle Log Extractor
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v1/battle-log/extract` | Process video upload |
-| `GET` | `/api/v1/battle-log/{id}/events.json` | Download extracted events |
-| `GET` | `/api/v1/battle-log/{id}/map-video` | Stream isolated minimap video |
-| `GET` | `/api/v1/battle-log/{id}/team-image` | Download team roster frame |
-| `DELETE` | `/api/v1/battle-log/{id}` | Clean up session files |
-
-### Match Stats OCR
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/v1/extract` | OCR match stats screenshot |
-| `GET` | `/api/v1/visualize` | Stats visualizer |
-
-### System
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | API root — endpoint directory |
-| `GET` | `/endpoints` | Dynamic route listing |
-| `GET` | `/api/v1/health` | Service health & available pipelines |
-| `GET` | `/docs` | Interactive Swagger UI |
+| Domain | Method | Endpoint | Description |
+|---|---|---|---|
+| **System** | `GET` | `/` | API root directory |
+| | `GET` | `/endpoints` | Dynamic registered route listing |
+| | `GET` | `/api/v1/health` | Service health & models info |
+| | `GET` | `/docs` | Interactive Swagger UI |
+| **Player Stats** | `POST` | `/api/v1/pipeline/match_stats` | Extract stats from scoreboard screenshot |
+| | `POST` | `/api/v1/pipeline/match_stats/debug`| Debug mode with base64 step images |
+| | `GET` | `/api/v1/visualize` | Interactive browser visualizer |
+| **Battle Log** | `POST` | `/api/v1/battle-log/extract` | Upload video (Runs Steps 1–6) |
+| | `POST` | `/api/v1/battle-log/{id}/extract-events`| Run Step 7 Vision extraction on-demand |
+| | `GET` | `/api/v1/battle-log/{id}/group-images` | List packed Step 6 event cards |
+| | `GET` | `/api/v1/battle-log/{id}/map-video` | Stream isolated 760×760 minimap video |
+| | `GET` | `/api/v1/battle-log/{id}/team-image`| Download team roster frame |
+| | `GET` | `/api/v1/battle-log/{id}/events.json`| Download extracted events |
+| | `DELETE`| `/api/v1/battle-log/{id}` | Clean up session files |
+| **Zone Tracker**| `POST` | `/api/v1/zone/process` | Process video for safe zones |
+| | `GET` | `/api/v1/zone/list` | List processed sessions |
+| | `GET` | `/api/v1/zone/maps` | List supported map templates |
+| | `GET` | `/api/v1/zone/{id}/status` | Processing status |
+| | `GET` | `/api/v1/zone/{id}/zones` | Download raw `zones.json` |
+| | `GET` | `/api/v1/zone/{id}/zones-map` | Download rendered PNG map |
+| | `GET` | `/api/v1/zone/{id}/visual` | Visual inspection dashboard |
 
 ---
 
@@ -154,39 +166,36 @@ docker build -t lazartrack-backend .
 docker run -p 8000:8000 --env-file .env lazartrack-backend
 ```
 
+---
+
 ## 📁 Project Structure
 
 ```
 Backend/
 ├── app/
-│   ├── api/v1/
-│   │   ├── zone_tracker.py      # Zone tracker endpoints & visual dashboard
-│   │   ├── battle_log.py        # Battle log extractor endpoints
-│   │   ├── extract.py           # Match stats OCR
-│   │   └── health.py
-│   ├── zone_tracker/            # 8-step zone detection pipeline
-│   │   ├── pipeline.py
-│   │   ├── normalizer.py
-│   │   ├── map_separator.py
-│   │   ├── map_cleaner.py
-│   │   ├── map_aligner.py
-│   │   ├── frame_registrar.py
-│   │   ├── zone_detector.py
-│   │   ├── zone_clusterer.py
-│   │   └── zone_renderer.py
-│   ├── pipelines/               # Battle log extraction pipeline
-│   └── ocr/                     # Match stats OCR modules
-├── assets/maps/                 # Reference blank map images
+│   ├── api/v1/                  # API routers (battle_log, extract, zone_tracker, visualize, health)
+│   ├── core/                    # Settings & logging configuration
+│   ├── ocr/                     # Smart table detector & normalization
+│   ├── pipelines/               # Orchestrators (five_step.py, video_pipeline.py)
+│   ├── schemas/                 # Pydantic models
+│   └── zone_tracker/            # 8-step safe zone detection modules
+├── assets/maps/                 # Blank reference map images (Bermuda, Purgatory, etc.)
+├── docs/                        # Comprehensive technical documentation
+│   ├── README.md                # Documentation index
+│   ├── SYSTEM_ARCHITECTURE.md   # Overall system design
+│   ├── PLAYER_STATS_PIPELINE.md # Scoreboard extraction guide
+│   ├── BATTLE_LOG_PIPELINE.md   # Video battle log guide
+│   ├── ZONE_TRACKER_PIPELINE.md # Safe zone tracking guide
+│   └── API_REFERENCE.md         # Complete REST API reference
 ├── scripts/                     # Standalone step runners & batch scripts
 ├── video/
-│   ├── input/                   # Drop raw match videos here (gitignored)
+│   ├── input/                   # Raw match videos (gitignored)
 │   └── output/                  # Pipeline session outputs (gitignored)
 ├── Dockerfile
-├── render.yaml
-└── requirements.txt
+├── requirements.txt
+└── README.md
 ```
 
 ## 📄 License
 
 MIT
-
