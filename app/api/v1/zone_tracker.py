@@ -13,16 +13,18 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import tempfile
 import time
 from typing import Any, Dict, List, Optional
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from app.core.auth import AuthenticatedUser, require_auth
 from app.core.config import settings
 from app.zone_tracker.pipeline import run_player_path_pipeline
 
@@ -32,6 +34,15 @@ router = APIRouter(prefix="/zone", tags=["Zone & Map Tracker"])
 # In-memory session cache and active task tracking
 ZONE_SESSIONS: Dict[str, Any] = {}
 ACTIVE_TASKS: Dict[str, Any] = {}
+
+# The 8-step pipeline is multi-minute, multi-core work on a small container —
+# run one at a time and shed additional requests with 429 instead of queueing
+# them into CPU/RAM exhaustion.
+_ZONE_PIPELINE_SEMAPHORE = asyncio.Semaphore(1)
+
+# Step artifact names must be plain filenames — blocks path traversal via the
+# {artifact_name} path parameter.
+_ARTIFACT_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\- ]*$")
 
 # Standard reference map lookup
 MAP_CATALOG: Dict[str, str] = {
@@ -169,43 +180,55 @@ async def list_available_maps():
 
 
 @router.get("/list", summary="List All Processed Zone Sessions")
-async def list_zone_sessions():
-    """List all existing zone tracker sessions stored on disk."""
+async def list_zone_sessions(user: AuthenticatedUser = Depends(require_auth)):
+    """List the zone tracker sessions owned by the requesting user."""
     backend_root = Path(__file__).resolve().parent.parent.parent.parent
     zone_base = backend_root / "video" / "output" / "zone"
     sessions = []
 
     if zone_base.exists():
         for item in sorted(zone_base.iterdir()):
-            if item.is_dir() and not item.name.startswith((".", "_")):
-                vid = item.name
-                zones_map = item / "zones_map.png"
-                zones_json = item / "zones.json"
-                session_json = item / "session.json"
-                count = 0
-                if zones_json.exists():
-                    try:
-                        with open(zones_json) as f:
-                            d = json.load(f)
-                            count = len(d.get("zones", []))
-                    except Exception:
-                        pass
-                sessions.append({
-                    "video_id": vid,
-                    "has_map": zones_map.exists(),
-                    "zones_count": count,
-                    "zones_map_url": f"/api/v1/zone/{vid}/zones-map",
-                    "visual_url": f"/api/v1/zone/{vid}/visual",
-                    "status_url": f"/api/v1/zone/{vid}/status",
-                })
+            if not (item.is_dir() and not item.name.startswith((".", "_"))):
+                continue
+            vid = item.name
+            # Only expose sessions this user created.
+            owner_id = None
+            session_json = item / "session.json"
+            if session_json.exists():
+                try:
+                    with open(session_json) as f:
+                        owner_id = json.load(f).get("owner_id")
+                except Exception:
+                    pass
+            if owner_id != user.user_id:
+                continue
+            zones_map = item / "zones_map.png"
+            zones_json = item / "zones.json"
+            count = 0
+            if zones_json.exists():
+                try:
+                    with open(zones_json) as f:
+                        d = json.load(f)
+                        count = len(d.get("zones", []))
+                except Exception:
+                    pass
+            sessions.append({
+                "video_id": vid,
+                "has_map": zones_map.exists(),
+                "zones_count": count,
+                "zones_map_url": f"/api/v1/zone/{vid}/zones-map",
+                "visual_url": f"/api/v1/zone/{vid}/visual",
+                "status_url": f"/api/v1/zone/{vid}/status",
+            })
     return {"total_sessions": len(sessions), "sessions": sessions}
 
 
 @router.post("/process", response_model=ZoneProcessResponse, summary="Process Video Through 8-Step Zone Pipeline")
 async def process_zone_pipeline(
     background_tasks: BackgroundTasks,
+    user: AuthenticatedUser = Depends(require_auth),
     file: Optional[UploadFile] = File(None, description="Uploaded match video (MP4/MOV)"),
-    video_path: Optional[str] = Form(None, description="Local path to video file (alternative to file upload)"),
+    video_path: Optional[str] = Form(None, description="Local path to video file (alternative to file upload; must live under Backend/video/)"),
     map_name: str = Form("solara", description="Map template name ('solara', 'nexterra', 'kalahari', 'bermuda', 'purgatory') or file path"),
     video_id: Optional[str] = Form(None, description="Custom video identifier (auto-generated if omitted)"),
     keep_intermediate: bool = Form(True, description="Preserve step1-step8 deliverables"),
@@ -220,13 +243,24 @@ async def process_zone_pipeline(
     6. Parallel multi-core zone observation extraction
     7. Chronological clustering into discrete safe zone phases
     8. Render clean white safe zones on reference base map
+
+    Requires authentication: Authorization: Bearer <supabase_access_token>.
+    Sessions are recorded with the owner's user id and only that user can
+    list them via /zone/list.
     """
     ref_map_path = _resolve_base_map(map_name)
 
     if not file and not video_path:
         raise HTTPException(status_code=400, detail="Must provide either an uploaded video file or video_path.")
 
-    assigned_id = str(video_id or uuid.uuid4().hex[:8])
+    if _ZONE_PIPELINE_SEMAPHORE.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="Another zone pipeline run is in progress. Try again shortly.",
+            headers={"Retry-After": "60"},
+        )
+
+    assigned_id = str(video_id or uuid.uuid4().hex)  # full UUID — not guessable
     temp_dir = None
     input_file_path = None
 
@@ -234,31 +268,59 @@ async def process_zone_pipeline(
         raw = await file.read()
         if not raw:
             raise HTTPException(status_code=400, detail="Uploaded video file is empty.")
+        if len(raw) > settings.MAX_VIDEO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Video exceeds {settings.MAX_VIDEO_BYTES // (1024 * 1024)} MB limit.",
+            )
         temp_dir = tempfile.mkdtemp(prefix=f"zone_{assigned_id}_")
         input_file_path = os.path.join(temp_dir, f"input_{assigned_id}.mp4")
         with open(input_file_path, "wb") as f:
             f.write(raw)
     else:
+        backend_root = Path(__file__).resolve().parent.parent.parent.parent
         p = Path(video_path)
         if not p.is_absolute():
-            backend_root = Path(__file__).resolve().parent.parent.parent.parent
             p = backend_root / video_path
+        # Local-path input must stay inside the Backend video workspace —
+        # otherwise an authenticated caller could feed any server file into
+        # the pipeline.
+        try:
+            p.resolve().relative_to((backend_root / "video").resolve())
+        except ValueError:
+            raise HTTPException(
+                status_code=403,
+                detail="video_path must point inside the Backend/video/ directory.",
+            )
         if not p.exists():
             raise HTTPException(status_code=404, detail=f"Local video file not found at: {p}")
         input_file_path = str(p)
 
     t0 = time.time()
+    await _ZONE_PIPELINE_SEMAPHORE.acquire()
     try:
-        log.info(f"[zone/process] Starting 8-step pipeline for video_id={assigned_id} on map={ref_map_path}")
+        log.info(
+            f"[zone/process] user={user.user_id} starting 8-step pipeline for video_id={assigned_id} on map={ref_map_path}"
+        )
         result = await asyncio.to_thread(
             run_player_path_pipeline,
             video_path=input_file_path,
             video_id=assigned_id,
+            output_base_dir=str(_get_zone_dir(assigned_id)),
             reference_map_path=ref_map_path,
             cleanup_intermediate=not keep_intermediate,
         )
         elapsed = round(time.time() - t0, 2)
+
+        # Record ownership so /zone/list only shows this user's sessions.
+        result["owner_id"] = user.user_id
         ZONE_SESSIONS[assigned_id] = result
+        session_json = _get_zone_dir(assigned_id) / "session.json"
+        try:
+            with open(session_json, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+        except Exception as se:
+            log.warning(f"Could not persist owner_id to session.json for {assigned_id}: {se}")
 
         zones = result.get("zones", [])
         return ZoneProcessResponse(
@@ -278,10 +340,13 @@ async def process_zone_pipeline(
             visual_dashboard_url=f"/api/v1/zone/{assigned_id}/visual",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         log.exception(f"Zone pipeline failed for {assigned_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
     finally:
+        _ZONE_PIPELINE_SEMAPHORE.release()
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -332,9 +397,20 @@ async def get_zones_map_image(video_id: str):
 @router.get("/{video_id}/step/{step_num}/{artifact_name}", summary="Download Specific Step Deliverable")
 async def get_step_artifact(video_id: str, step_num: int, artifact_name: str):
     """Download an intermediate artifact from step1 through step8."""
+    if not 1 <= step_num <= 8:
+        raise HTTPException(status_code=400, detail="step_num must be between 1 and 8.")
+    if not _ARTIFACT_NAME_RE.match(artifact_name) or ".." in artifact_name:
+        raise HTTPException(status_code=400, detail="Invalid artifact name.")
+
     zone_dir = _get_zone_dir(video_id)
     step_dir = zone_dir / f"step{step_num}"
     target_file = step_dir / artifact_name
+
+    # Defense in depth: the resolved path must stay inside the step directory.
+    try:
+        target_file.resolve().relative_to(step_dir.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid artifact path.")
 
     if not target_file.exists():
         raise HTTPException(status_code=404, detail=f"Artifact '{artifact_name}' in step{step_num} not found.")

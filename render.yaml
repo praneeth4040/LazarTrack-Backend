@@ -12,6 +12,20 @@ services:
       sizeGB: 50
     envVars:
       - key: OPENROUTER_API_KEY
-        sync: false         # Set manually in Render dashboard
+        sync: false
+      - key: SUPABASE_JWT_SECRET
+        sync: false         # Supabase project JWT secret (Settings → API → JWT Secret). Optional — JWKS/remote verification is used when unset.
+      - key: SUPABASE_CLIENT_URL
+        sync: false
+      - key: SUPABASE_CLIENT_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false         # Server-side only: Supabase Storage uploads + matches.assets_url updates
+      - key: ALLOWED_ORIGINS
+        sync: false         # Comma-separated web origins allowed by CORS (defaults to lazartrack.app / lazarflow.app / localhost)
+      - key: ALLOWED_ORIGIN_REGEX
+        sync: false         # Optional regex for preview deployments (default: ^https://[a-z0-9-]+\.vercel\.app$)
+      - key: ALLOWED_ASSET_HOSTS
+        sync: false         # Host suffixes the server will fetch asset URLs from (default: .supabase.co)
       - key: VIDEO_OUTPUT_DIR
         value: /app/video/output

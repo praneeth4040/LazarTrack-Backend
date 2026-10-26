@@ -98,7 +98,12 @@ class PlayerPathMapCleaner:
         timeline_y = 930  # Default fallback
         if lines is not None:
             for l in lines:
-                x1, y1, x2, y2 = l[0]
+                # HoughLinesP returns (N,1,4) on OpenCV 4 and (N,4) on OpenCV 5 —
+                # normalise so the unpack works on both.
+                seg = np.asarray(l).reshape(-1)
+                if seg.size != 4:
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in seg)
                 if abs(y2 - y1) <= 2 and abs(x2 - x1) > 250:
                     timeline_y = 880 + int(y1)
                     break

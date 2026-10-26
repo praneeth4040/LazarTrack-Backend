@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -7,20 +9,46 @@ from app.api.router import api_router
 
 setup_logging()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Jobs left queued/running by a previous process cannot be resumed —
+    # mark them failed so clients see an actionable state.
+    from app.services.jobs import job_manager
+    job_manager.recover()
+    yield
+
+
 app = FastAPI(
     title=settings.PROJECT_NAME,
     version=settings.VERSION,
     description="Intelligent Extraction & Safe Zone Tracking Suite for Free Fire esports matches.",
     redoc_url=None,
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=False,
-)
+# CORS: restrict browser access to the web app's known origins. Auth is Bearer
+# tokens (no cookies), so this is not the primary defense — it stops other
+# origins from making credentialed-looking calls and leaking responses to
+# arbitrary web pages. Set ALLOWED_ORIGINS="*" only for local testing.
+_origins = [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
+if "*" in _origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=False,
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_origins,
+        allow_origin_regex=settings.ALLOWED_ORIGIN_REGEX or None,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        allow_credentials=False,
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -64,7 +92,8 @@ async def root():
                 "process": "POST /api/v1/battle-log/extract",
             },
             "match_stats_ocr": {
-                "extract": "POST /api/v1/extract",
+                "extract": "POST /api/v1/pipeline/match_stats",
+                "extract_debug": "POST /api/v1/pipeline/match_stats/debug",
                 "visualizer": "GET /api/v1/visualize",
             },
             "system_health": {

@@ -237,3 +237,26 @@ curl -X POST http://localhost:8000/api/v1/battle-log/a1b2c3d4/extract-events
 - **Method**: `GET`
 - **Path**: `/api/v1/zone/{video_id}/visual`
 - **Description**: Browser UI displaying intermediate artifacts from each of the 8 steps.
+
+---
+
+## 5. Async Jobs API (fire-and-forget pipelines)
+
+Long pipelines run as background jobs. Submit → `202` + job record → poll until terminal.
+All endpoints require `Authorization: Bearer <supabase_access_token>`; users only see their own jobs.
+Job records persist to disk and survive restarts; jobs orphaned by a restart are marked `failed`.
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/v1/jobs/match-stats` | POST | Submit screenshot stats job. Body: `{match_id, screenshot_url}` → `202 {job}` |
+| `/api/v1/jobs/battle-log` | POST | Submit battle-log video job. Body: `{match_id, video_url, run_step7?}` → `202 {job}` |
+| `/api/v1/jobs` | GET | List my jobs. Query: `match_id`, `kind`, `status`, `include_result` |
+| `/api/v1/jobs/{job_id}` | GET | Full job record incl. `progress` and, when completed, `result` |
+| `/api/v1/jobs/{job_id}` | DELETE | Cancel a queued job, or delete a finished one (`409` if running) |
+
+**Job record:** `{id, kind: match_stats|battle_log, status: queued|running|completed|failed|cancelled, match_id, progress: {stage, message, percent}, result, error, created_at, started_at, finished_at}`
+
+- `match_stats` result = the same payload as `POST /pipeline/match_stats`.
+- `battle_log` result = the same payload as `POST /battle-log/extract` (events, team_slots, download_urls…).
+- Concurrency caps: one battle-log job at a time, two stats jobs; a queued job starts as soon as a slot frees.
+- The synchronous `POST /pipeline/match_stats` and `POST /battle-log/extract` endpoints still exist and share the same runners, but the jobs API is preferred for anything long-running.

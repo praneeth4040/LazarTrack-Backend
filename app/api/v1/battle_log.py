@@ -1,31 +1,41 @@
 """
 Battle Log Video Processing API Endpoints
-
-Simple endpoints for processing Free Fire battle log videos.
 """
 
+import asyncio
 import os
 import logging
 import tempfile
 import shutil
 import uuid
+import json
 from typing import List, Optional
-from fastapi import APIRouter, File, UploadFile, HTTPException, BackgroundTasks
+
+import httpx
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Depends
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 
+from app.core.auth import AuthenticatedUser, require_auth
 from app.core.config import settings
 from app.pipelines.video_pipeline import run_complete_video_pipeline, run_step7_on_session
+from app.services.supabase_storage import storage_client
 
 log = logging.getLogger("app.api.v1.battle_log")
 router = APIRouter(prefix="/battle-log", tags=["Battle Log"])
 
-# Store pipeline outputs temporarily
 PIPELINE_OUTPUTS = {}
 
 
+# ─── Request / Response models ────────────────────────────────────────────────
+
+class BattleLogRequest(BaseModel):
+    match_id:  str
+    video_url: str        # public URL of the raw video already in match-assets bucket
+    run_step7: bool = False
+
+
 class BattleLogEvent(BaseModel):
-    """Single battle log event"""
     event_id: int
     time: Optional[str]
     type: str
@@ -41,38 +51,61 @@ class BattleLogEvent(BaseModel):
 
 
 class BattleLogResponse(BaseModel):
-    """Complete battle log extraction response"""
     success: bool
     video_id: str
     events: List[BattleLogEvent] = Field(default_factory=list)
     team_slots: dict = Field(default_factory=dict)
     metadata: dict = Field(default_factory=dict)
     download_urls: dict = Field(default_factory=dict)
+    storage_path: Optional[str] = None
 
 
-async def _validate_video_file(file: UploadFile) -> bytes:
-    """Validate and read uploaded video file"""
-    content_type = (file.content_type or "").lower()
-    allowed_types = {"video/mp4", "video/quicktime", "video/x-msvideo", "video/mpeg"}
-    
-    if content_type not in allowed_types and not content_type.startswith("video/"):
+
+async def _download_video(url: str) -> bytes:
+    """Download the raw battle log video from Supabase Storage."""
+    _ensure_allowed_asset_host(url)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            resp = await client.get(url, follow_redirects=True)
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Could not download video: {e}")
+
+    if resp.status_code != 200:
         raise HTTPException(
-            status_code=415,
-            detail=f"Unsupported video type. Please upload MP4, MOV, or AVI."
+            status_code=502,
+            detail=f"Storage returned HTTP {resp.status_code} for video URL.",
         )
-    
-    raw = await file.read()
+
+    raw = resp.content
     if not raw:
-        raise HTTPException(status_code=400, detail="Empty file received.")
-    
-    max_size = 500 * 1024 * 1024  # 500MB
+        raise HTTPException(status_code=422, detail="Downloaded video is empty.")
+
+    max_size = 500 * 1024 * 1024  # 500 MB
     if len(raw) > max_size:
-        raise HTTPException(status_code=413, detail=f"File exceeds {max_size // (1024 * 1024)} MB limit.")
-    
+        raise HTTPException(status_code=413, detail="Video exceeds 500 MB limit.")
+
     return raw
 
 
 import asyncio
+
+def _ensure_allowed_asset_host(url: str) -> None:
+    """Block server-side fetches of arbitrary URLs (SSRF).
+
+    Users supply the storage URL; without this check an authenticated caller
+    could make the backend fetch internal endpoints and observe status/size.
+    Allowed hosts are configured via ALLOWED_ASSET_HOSTS (suffix match).
+    """
+    from urllib.parse import urlparse
+    allowed = [h.strip().lower() for h in settings.ALLOWED_ASSET_HOSTS.split(",") if h.strip()]
+    if not allowed:
+        return
+    host = (urlparse(url).hostname or "").lower()
+    if not host or not any(host == h or host.endswith(h) for h in allowed):
+        raise HTTPException(
+            status_code=400,
+            detail=f"URL host is not allowed. Assets must be hosted on: {', '.join(allowed)}",
+        )
 
 def _get_pipeline_output(video_id: str) -> dict:
     """Retrieve session outputs from memory or persistent disk metadata."""
@@ -117,6 +150,23 @@ def _get_pipeline_output(video_id: str) -> dict:
     raise HTTPException(status_code=404, detail=f"Video session '{video_id}' not found or expired")
 
 
+def _require_session_owner(video_id: str, user: AuthenticatedUser) -> dict:
+    """Load a session and enforce that it belongs to the requesting user."""
+    session = _get_pipeline_output(video_id)
+    owner = session.get("user_id")
+    if not owner:
+        raise HTTPException(
+            status_code=403,
+            detail="This session has no recorded owner and cannot be accessed.",
+        )
+    if owner != user.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="You do not have access to this video session.",
+        )
+    return session
+
+
 def _cleanup_pipeline_output(video_id: str, output_dir: str):
     """Background task to cleanup old pipeline outputs"""
     try:
@@ -129,85 +179,219 @@ def _cleanup_pipeline_output(video_id: str, output_dir: str):
         log.error(f"Error cleaning up video_id={video_id}: {e}")
 
 
-@router.post("/extract", response_model=BattleLogResponse)
-async def extract_battle_log(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(..., description="Free Fire battle log video"),
-    cleanup_intermediate: bool = True,
-    auto_cleanup_hours: int = 24,
-    run_step7: bool = False,
-):
+def _upload_battle_log_to_supabase(
+    user_id: str,
+    match_id: str,
+    output_dir: str,
+    result: dict,
+) -> dict:
     """
-    Extract battle log deliverables (group images, map video, team image) from a video.
-    Stops at Step 6 by default (run_step7=False). Step 7 can be triggered on demand.
+    Upload all battle log outputs to Supabase Storage
+    
+    Structure:
+      {user_id}/{match_id}/battle_log/
+        ├── group_images/
+        │   ├── group_000.png
+        │   ├── group_001.png
+        │   └── ...
+        ├── map_video.mp4
+        ├── team_image.png
+        └── events.json
+    
+    Returns dict with public URLs for all files
     """
-    raw_video = await _validate_video_file(file)
-    video_id = str(uuid.uuid4())[:8]
-    
-    log.info(f"[battle-log/extract] Processing '{file.filename}' as video_id={video_id} (run_step7={run_step7})")
-    
-    temp_dir = tempfile.mkdtemp(prefix=f"video_{video_id}_")
-    input_video_path = os.path.join(temp_dir, f"input_{video_id}.mp4")
+    base_path = f"{user_id}/{match_id}/battle_log"
+    urls = {}
     
     try:
-        with open(input_video_path, 'wb') as f:
-            f.write(raw_video)
+        # Upload group images
+        group_images = result.get("group_images", [])
+        group_urls = []
+        for group_img_path in group_images:
+            if os.path.exists(group_img_path):
+                filename = os.path.basename(group_img_path)
+                remote_path = f"{base_path}/group_images/{filename}"
+                url = storage_client.upload_file(group_img_path, remote_path, "image/png")
+                if url:
+                    group_urls.append({"name": filename, "url": url})
+        urls["group_images"] = group_urls
         
+        # Upload map video
+        map_video_path = result.get("map_video_path")
+        if map_video_path and os.path.exists(map_video_path):
+            remote_path = f"{base_path}/map_video.mp4"
+            url = storage_client.upload_file(map_video_path, remote_path, "video/mp4")
+            urls["map_video"] = url
+        
+        # Upload team image
+        team_image_path = result.get("team_image")
+        if team_image_path and os.path.exists(team_image_path):
+            remote_path = f"{base_path}/team_image.png"
+            url = storage_client.upload_file(team_image_path, remote_path, "image/png")
+            urls["team_image"] = url
+        
+        # Upload events JSON
+        events_file_path = result.get("events_file_path")
+        if events_file_path and os.path.exists(events_file_path):
+            remote_path = f"{base_path}/events.json"
+            url = storage_client.upload_file(events_file_path, remote_path, "application/json")
+            urls["events_json"] = url
+        
+        log.info(f"✓ All battle log files uploaded to Supabase for {user_id}/{match_id}")
+        return urls
+        
+    except Exception as e:
+        log.error(f"Error uploading battle log to Supabase: {e}")
+        return urls
+
+
+# Strong references to fire-and-forget cleanup tasks so they are not
+# garbage-collected mid-sleep.
+_CLEANUP_TASKS: set = set()
+
+
+async def run_battle_log_extraction(
+    user_id: str,
+    body: BattleLogRequest,
+    progress=None,
+) -> dict:
+    """
+    Shared runner for the 7-step battle log pipeline. Used by both the
+    synchronous endpoint and the async Jobs API.
+
+    Returns the BattleLogResponse payload as a JSON-serializable dict.
+    """
+    def _p(stage: str, message: str, percent: Optional[float] = None):
+        if progress:
+            progress(stage, message, percent)
+
+    video_id = uuid.uuid4().hex  # full UUID — session URLs must not be guessable
+    log.info(
+        "[battle-log/extract] user=%s match_id=%s video_id=%s",
+        user_id, body.match_id, video_id,
+    )
+
+    # Download video from bucket
+    _p("downloading", "Downloading video from storage…", 5)
+    raw_video = await _download_video(body.video_url)
+
+    temp_dir = tempfile.mkdtemp(prefix=f"video_{video_id}_")
+    input_video_path = os.path.join(temp_dir, f"input_{video_id}.mp4")
+
+    try:
+        with open(input_video_path, "wb") as f:
+            f.write(raw_video)
+
         output_base_dir = os.path.join(settings.VIDEO_OUTPUT_DIR, video_id)
         os.makedirs(output_base_dir, exist_ok=True)
-        
-        # Execute synchronous pipeline off the main event loop
+
+        _p("pipeline", "Running battle log pipeline (steps 1–6)…", 30)
         result = await asyncio.to_thread(
             run_complete_video_pipeline,
             video_path=input_video_path,
             video_id=video_id,
             output_base_dir=output_base_dir,
-            cleanup_intermediate=cleanup_intermediate,
-            run_step7=run_step7,
+            cleanup_intermediate=True,
+            run_step7=body.run_step7,
         )
-        
+
         if not result["success"]:
             raise HTTPException(status_code=500, detail=f"Pipeline failed: {result.get('error')}")
-        
+
+        # Upload outputs to Supabase Storage
+        _p("uploading", "Uploading results to storage…", 80)
+        supabase_urls = await asyncio.to_thread(
+            _upload_battle_log_to_supabase,
+            user_id=user_id,
+            match_id=body.match_id,
+            output_dir=output_base_dir,
+            result=result,
+        )
+
+        log.info(f"Supabase upload result: {supabase_urls}")
+
         session_info = {
-            "video_id": video_id,
-            "output_dir": output_base_dir,
+            "video_id":    video_id,
+            "user_id":     user_id,
+            "match_id":    body.match_id,
+            "output_dir":  output_base_dir,
             "group_images": result.get("group_images", []),
-            "map_video": result.get("map_video_path"),
-            "team_image": result.get("team_image"),
+            "map_video":   result.get("map_video_path"),
+            "team_image":  result.get("team_image"),
             "events_file": result.get("events_file_path"),
-            "team_slots": result.get("team_slots", {}),
-            "metadata": result.get("metadata", {}),
+            "team_slots":  result.get("team_slots", {}),
+            "metadata":    result.get("metadata", {}),
+            "supabase_urls": supabase_urls,
         }
         PIPELINE_OUTPUTS[video_id] = session_info
-        
-        # Persist session.json for multi-worker safety
+
         try:
             with open(os.path.join(output_base_dir, "session.json"), "w") as f:
                 json.dump(session_info, f, indent=2)
         except Exception as se:
             log.warning(f"Could not write session.json: {se}")
-        
-        if auto_cleanup_hours > 0:
-            async def delayed_cleanup():
-                await asyncio.sleep(auto_cleanup_hours * 3600)
-                _cleanup_pipeline_output(video_id, output_base_dir)
-            background_tasks.add_task(delayed_cleanup)
-        
+
+        # Schedule local cleanup after 24 h
+        async def delayed_cleanup():
+            await asyncio.sleep(24 * 3600)
+            _cleanup_pipeline_output(video_id, output_base_dir)
+        cleanup_task = asyncio.create_task(delayed_cleanup())
+        _CLEANUP_TASKS.add(cleanup_task)
+        cleanup_task.add_done_callback(_CLEANUP_TASKS.discard)
+
+        # Use Supabase URLs if successfully uploaded, otherwise use fallback relative URLs
+        if supabase_urls and supabase_urls.get("group_images"):
+            download_urls = supabase_urls
+            log.info(f"Using Supabase URLs for battle log files")
+        else:
+            log.warning(f"Supabase upload didn't return group_images, using fallback URLs")
+            download_urls = {
+                "group_images": f"/api/v1/battle-log/{video_id}/group-images",
+                "map_video":    f"/api/v1/battle-log/{video_id}/map-video" if result.get("map_video_path") else None,
+                "team_image":   f"/api/v1/battle-log/{video_id}/team-image" if result.get("team_image") else None,
+                "events_json":  f"/api/v1/battle-log/{video_id}/events.json",
+            }
+
+        # ── Update match.assets_url with pipeline URLs ────────────────────────────
+        # Stores the Supabase URLs so the frontend can fetch them later. Uses the
+        # raw PostgREST client (supabase-py's dependency stack conflicts with the
+        # pinned pydantic — see app/services/supabase_db.py).
+        _p("saving", "Updating match record…", 95)
+        try:
+            from app.services.supabase_db import merge_match_pipeline_assets
+
+            # group_images: just URLs, no names
+            pipeline_assets = {
+                "group_images": [
+                    img["url"]
+                    for img in download_urls.get("group_images", [])
+                ] if isinstance(download_urls.get("group_images"), list) else None,
+                "map_video": download_urls.get("map_video"),
+                "team_image": download_urls.get("team_image"),
+                "events_json": download_urls.get("events_json"),
+            }
+
+            if merge_match_pipeline_assets(body.match_id, pipeline_assets):
+                log.info(f"✓ Updated match.assets_url for {body.match_id} with pipeline URLs")
+            else:
+                log.warning("Could not update match.assets_url (see errors above)")
+
+        except Exception as e:
+            log.error(f"Error updating match.assets_url: {e}", exc_info=True)
+            # Don't fail the extraction if database update fails
+            pass
+
+        _p("done", "Battle log extraction complete", 100)
         return BattleLogResponse(
             success=True,
             video_id=video_id,
-            events=[BattleLogEvent(**event) for event in result.get("events", [])],
+            events=[BattleLogEvent(**e) for e in result.get("events", [])],
             team_slots=result.get("team_slots", {}),
             metadata=result.get("metadata", {}),
-            download_urls={
-                "group_images": f"/api/v1/battle-log/{video_id}/group-images",
-                "map_video": f"/api/v1/battle-log/{video_id}/map-video" if result.get("map_video_path") else None,
-                "team_image": f"/api/v1/battle-log/{video_id}/team-image" if result.get("team_image") else None,
-                "events_json": f"/api/v1/battle-log/{video_id}/events.json"
-            }
-        )
-        
+            download_urls=download_urls,
+            storage_path=f"{user_id}/{body.match_id}/battle_log",
+        ).model_dump()
+
     except HTTPException:
         raise
     except Exception as e:
@@ -218,14 +402,45 @@ async def extract_battle_log(
             shutil.rmtree(temp_dir)
 
 
-@router.post("/{video_id}/extract-events", summary="Run Step 7 Vision extraction on-demand (Admin)")
-async def extract_events_on_demand(video_id: str):
+@router.post("/extract", response_model=BattleLogResponse)
+async def extract_battle_log(
+    body: BattleLogRequest,
+    user: AuthenticatedUser = Depends(require_auth),
+):
+    """
+    Authenticated endpoint. Accepts a JSON body with match_id and video_url.
+
+    Flow:
+      1. Verify JWT → extract user_id
+      2. Download the raw video from the Supabase Storage URL
+      3. Run the 7-step battle log pipeline
+      4. Upload all outputs back to Supabase Storage under
+             {user_id}/{match_id}/battle_log/
+      5. Return structured events + public download URLs
+
+    The caller must send:
+        Authorization: Bearer <supabase_access_token>
+
+    Note: this call blocks for the full pipeline duration (5–10 min). For a
+    fire-and-forget flow prefer the async Jobs API
+    (POST /api/v1/jobs/battle-log) which returns a job id immediately.
+    """
+    return BattleLogResponse(
+        **await run_battle_log_extraction(user.user_id, body)
+    )
+
+
+@router.post("/{video_id}/extract-events", summary="Run Step 7 Vision extraction on-demand")
+async def extract_events_on_demand(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """
     On-demand Step 7 execution:
     Runs the Vision Language model on the existing Step 6 group images in the session.
     Used by admin portal or downstream suggestion engine builder.
     """
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     output_base_dir = session.get("output_dir")
     if not output_base_dir or not os.path.exists(output_base_dir):
         raise HTTPException(status_code=404, detail="Session directory not found")
@@ -246,11 +461,29 @@ async def extract_events_on_demand(video_id: str):
 
 
 @router.get("/{video_id}/group-images")
-async def get_group_images(video_id: str):
-    """Get list of group images from step 6"""
-    session = _get_pipeline_output(video_id)
+async def get_group_images(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
+    """Get list of group images from step 6.
+
+    Returns the public Supabase URLs when the outputs were uploaded, so the
+    client can render them directly; falls back to relative backend URLs.
+    """
+    session = _require_session_owner(video_id, user)
     group_images = session.get("group_images", [])
-    
+
+    supabase_images = (session.get("supabase_urls") or {}).get("group_images")
+    if supabase_images:
+        return {
+            "video_id": video_id,
+            "group_count": len(supabase_images),
+            "images": [
+                {"name": img.get("name"), "url": img.get("url")}
+                for img in supabase_images
+            ],
+        }
+
     return {
         "video_id": video_id,
         "group_count": len(group_images),
@@ -265,9 +498,13 @@ async def get_group_images(video_id: str):
 
 
 @router.get("/{video_id}/group-image/{image_name}")
-async def download_group_image(video_id: str, image_name: str):
+async def download_group_image(
+    video_id: str,
+    image_name: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """Download a specific group image"""
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     group_images = session.get("group_images", [])
     image_path = next((img for img in group_images if os.path.basename(img) == image_name), None)
     
@@ -284,9 +521,12 @@ async def download_group_image(video_id: str, image_name: str):
 
 
 @router.get("/{video_id}/map-video")
-async def download_map_video(video_id: str):
+async def download_map_video(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """Download the normalized video from step 1"""
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     map_video = session.get("map_video")
     
     if not map_video:
@@ -301,9 +541,12 @@ async def download_map_video(video_id: str):
 
 
 @router.get("/{video_id}/team-image")
-async def download_team_image(video_id: str):
+async def download_team_image(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """Download the team identification frame"""
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     team_image = session.get("team_image")
     
     if not team_image:
@@ -318,9 +561,12 @@ async def download_team_image(video_id: str):
 
 
 @router.get("/{video_id}/events.json")
-async def download_events_json(video_id: str):
+async def download_events_json(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """Download the complete events JSON file"""
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     events_file = session.get("events_file")
     
     if not events_file:
@@ -335,9 +581,12 @@ async def download_events_json(video_id: str):
 
 
 @router.delete("/{video_id}")
-async def cleanup_video(video_id: str):
+async def cleanup_video(
+    video_id: str,
+    user: AuthenticatedUser = Depends(require_auth),
+):
     """Manually cleanup/delete all outputs for a processed video"""
-    session = _get_pipeline_output(video_id)
+    session = _require_session_owner(video_id, user)
     output_dir = session["output_dir"]
     _cleanup_pipeline_output(video_id, output_dir)
     
